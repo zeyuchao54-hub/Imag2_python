@@ -82,7 +82,8 @@ class IndustrialPipeline:
         parser = argparse.ArgumentParser(description="PointToCAD 工业级点云逆向工程与检测系统")
         parser.add_argument("--input", "-i", type=str, required=True, help="输入的 3D 点云文件路径 (.ply, .pcd)")
         parser.add_argument("--out_dir", "-o", type=str, default="outputs", help="结果导出目录路径")
-        parser.add_argument("--export_cad", action="store_true", help="是否导出 .step 格式 CAD 模型")
+        parser.add_argument("--export_cad", action="store_true",
+                            help="是否导出 CAD 模型 (需要 CAD 内核后端; 未安装时跳过并告警，不会生成文件)")
         parser.add_argument("--batch", action="store_true", help="批处理/静默模式 (不显示 3D 可视化，跳过交互标定)")
 
         # ---------------------------------------------------------
@@ -333,7 +334,12 @@ class IndustrialPipeline:
             if self.args.export_cad and not self._auto_scale_pending:
                 scaled_vertices = vertices * scale_info.factor if len(vertices) > 0 else vertices
                 cad_path = reporter.export_step(scaled_vertices, merged_planes)
-                self.logger.info(f"      [CAD模型] STEP 文件已保存至: {cad_path}")
+                if cad_path:
+                    self.logger.info(f"      [CAD模型] STEP 文件已保存至: {cad_path}")
+                else:
+                    self.logger.warning(
+                        "      [CAD模型] STEP 未生成 (当前环境无 CAD B-Rep 后端)，其余报告不受影响"
+                    )
 
             self.logger.info(f"      文件导出完成 -> 耗时: {time.time() - t5:.3f}s")
 
@@ -407,9 +413,14 @@ class IndustrialPipeline:
                     )
                     # 阶段 5 被推迟的 STEP 导出: 按估计尺度重新计算并导出
                     if self.args.export_cad:
-                        scaled_vertices = vertices * scale_est if len(vertices) > 0 else vertices
+                        scaled_vertices = vertices * scale_info.factor if len(vertices) > 0 else vertices
                         cad_path = reporter.export_step(scaled_vertices, merged_planes)
-                        self.logger.info(f"      [CAD模型] STEP 文件已按估计比例尺导出: {cad_path}")
+                        if cad_path:
+                            self.logger.info(f"      [CAD模型] STEP 文件已按估计比例尺导出: {cad_path}")
+                        else:
+                            self.logger.warning(
+                                "      [CAD模型] STEP 未生成 (当前环境无 CAD B-Rep 后端)，其余报告不受影响"
+                            )
 
                 # 4. 构建 datum 平面列表 (主基准面 → Datum A, 次基准面 → Datum B, 物理单位)
                 datum_planes = []

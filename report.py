@@ -126,21 +126,68 @@ class ReportGenerator:
         self.logger.info("JSON 报告导出成功！")
         return str(file_path.absolute())
 
-    def export_step(self, vertices: np.ndarray, planes: List[Plane], filename: str = "model.step") -> str:
+    #: 可写出 STEP (B-Rep) 的 CAD 内核后端，按优先级排列。
+    #: STEP 是边界表示格式，必须借助 OpenCASCADE 系内核，trimesh/numpy 均无法直接写出。
+    _CAD_BACKENDS = ("cadquery", "OCP", "OCC")
+
+    @classmethod
+    def _detect_cad_backend(cls) -> Optional[str]:
+        """探测当前环境可用的 CAD 内核后端，无则返回 None。"""
+        for name in cls._CAD_BACKENDS:
+            try:
+                __import__(name)
+                return name
+            except ImportError:
+                continue
+        return None
+
+    def export_step(self, vertices: np.ndarray, planes: List[Plane],
+                    filename: str = "model.step") -> Optional[str]:
         """
-        导出为 CAD 的 STEP 格式
-        (此处保留你原有的导出逻辑或库调用，如 pythonocc-core 或 FreeCAD API)
-        注意: 传入这里的 vertices 应该已经是应用过 scale_factor 之后的绝对坐标。
+        导出为 CAD 的 STEP 格式。
+
+        重要: 本方法**不会**在没有 CAD 内核的环境下谎报成功。
+        STEP 需要 OpenCASCADE 系后端 (cadquery 或 pythonocc-core)，
+        若均未安装，则返回 None 并明确告警，磁盘上不会留下任何文件。
+
+        :param vertices: CAD 角点坐标 (应为已施加 scale_factor 的绝对物理坐标)
+        :param planes: 融合后的平面列表
+        :return: 成功时返回文件绝对路径；无 CAD 后端时返回 None
         """
         file_path = self.out_dir / filename
-        self.logger.info(f"正在生成 STEP 文件: {file_path} ...")
+        backend = self._detect_cad_backend()
+
+        if backend is None:
+            self.logger.warning(
+                "STEP 导出已跳过: 未检测到 CAD 内核后端 "
+                f"(已尝试 {', '.join(self._CAD_BACKENDS)})。"
+                f"文件 '{file_path.name}' 未被创建。"
+                "如需真正的 B-Rep STEP 输出，请安装: pip install cadquery"
+            )
+            return None
+
+        self.logger.info(f"正在生成 STEP 文件 (后端: {backend}): {file_path} ...")
 
         # ---------------------------------------------------------
-        # (保留你原本项目中实际的 CAD 导出代码逻辑放置于此)
-        # 例如构建 BRep 边界表示、组装 Face、保存 TopoDS_Shape 等
+        # B-Rep 重建接入点
         # ---------------------------------------------------------
-
-        return str(file_path.absolute())
+        # 此处需要把 vertices / planes 转成面片 (Face) → 壳 (Shell) → 体 (Solid)。
+        # 以 cadquery 为例:
+        #     import cadquery as cq
+        #     wp = cq.Workplane("XY")
+        #     for p in planes:
+        #         hull2d = <p.cloud 投影到 p.normal 局部坐标系的 2D 凸包>
+        #         wp = wp.add(cq.Face.makeFromWires(
+        #             cq.Wire.makePolygon([cq.Vector(*v) for v in hull3d], close=True)
+        #         ))
+        #     cq.exporters.export(wp, str(file_path), exportType="STEP")
+        # 在完成实现并使 tests/test_report.py 覆盖该分支之前，
+        # 这里主动返回 None 而不是写一个空文件后谎报成功。
+        self.logger.warning(
+            f"检测到 CAD 后端 '{backend}'，但 B-Rep 重建逻辑尚未实现，"
+            f"'{file_path.name}' 未被创建。请在此处接入 OpenCASCADE 建模调用。"
+        )
+        return None
 
     def export_registration_json(
             self,
