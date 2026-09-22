@@ -125,17 +125,18 @@ class TestDeviationVectorization(unittest.TestCase):
         tn /= np.linalg.norm(tn, axis=1, keepdims=True)
 
         az = DeviationAnalyzer()
-        t0 = time.time()
+        t0 = time.perf_counter()
         s_vec, _ = az._compute_one_direction(_cloud(src, n), _cloud(tgt, tn), True)
-        t_vec = time.time() - t0
+        t_vec = max(time.perf_counter() - t0, 1e-9)
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         s_ref, _ = _reference_one_direction(src, n, tgt, tn, True)
-        t_ref = time.time() - t0
+        t_ref = max(time.perf_counter() - t0, 1e-9)
 
         self.assertTrue(np.allclose(s_vec, s_ref, atol=1e-10))
+        # 实测约 100 倍加速，阈值取 5 倍留有充足余量
         self.assertLess(t_vec, t_ref / 5.0,
-                        f"向量化 {t_vec:.3f}s 未显著快于逐点 {t_ref:.3f}s")
+                        f"向量化 {t_vec:.4f}s 未显著快于逐点 {t_ref:.4f}s")
 
 
 class TestVertexDedup(unittest.TestCase):
@@ -212,24 +213,28 @@ class TestVertexDedup(unittest.TestCase):
 
     def test_scales_far_below_quadratic(self):
         """
-        同算法下规模翻倍，耗时应远低于 4 倍。
+        同算法下规模扩大 8 倍，耗时增长应远低于 64 倍 (二次复杂度)。
 
-        规模取 20000/40000: 实测分别约 0.007s / 0.042s，均远高于计时器分辨率。
-        (更小的规模下耗时会落到 timer 分辨率以下，测出 0 导致比值无意义。)
+        设计要点 (避免此类测试自身成为 flaky 源):
+          - 规模跨 8 倍而非 2 倍: O(n log n) 预计约 9 倍，二次为 64 倍，
+            阈值取 20 留有 2 倍余量，机器噪声/GC 不会把结论翻转;
+          - 计时前先跑一次小规模预热，剔除 cKDTree 首次导入与首次分配的
+            固定开销 (此前直接计时，预热被算进 t_small，导致比值时高时低);
+          - 绝对耗时的下限断言由 test_large_size_stays_fast 覆盖，此处专测增长阶。
         """
         def timed(n):
             rng = np.random.default_rng(6)
             v = rng.uniform(0, 60, (n, 3))
-            t0 = time.time()
+            self._run_new(v)  # 预热，不计时
+            t0 = time.perf_counter()
             self._run_new(v)
-            return time.time() - t0
+            return time.perf_counter() - t0
 
-        t_small = timed(20000)
-        t_large = timed(40000)
+        t_small = timed(50_000)
+        t_large = timed(400_000)
         ratio = t_large / t_small
-        # 二次复杂度会给出 ≈4；O(n log n) 约 2.2。留足余量取 3.0。
-        self.assertLess(ratio, 3.0,
-                        f"规模翻倍耗时比 {ratio:.2f}，接近二次复杂度 (二次应为 4.0)")
+        self.assertLess(ratio, 20.0,
+                        f"规模 8 倍耗时比 {ratio:.2f}，接近二次复杂度 (二次应为 64.0)")
 
     def test_handles_degenerate_input(self):
         self.assertEqual(len(self._run_new(np.zeros((1, 3)))), 1)
