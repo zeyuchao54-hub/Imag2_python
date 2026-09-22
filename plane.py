@@ -149,6 +149,46 @@ class Plane:
         self.obb = self.cloud.get_oriented_bounding_box()
         self.area = self._estimate_area()
 
+    def scale(self, factor: float) -> 'Plane':
+        """
+        将本平面整体迁移到物理单位 (mm)。
+
+        这是全流水线唯一的平面尺度施加入口。调用之后，本对象的**全部**派生量
+        —— cloud / model 的截距 d / centroid / area / obb —— 都处于物理单位，
+        下游 (报表导出、Datum 权重、GD&T) 无需再手工乘以 scale_factor。
+
+        注意:
+          - model 的前三列是单位法向，缩放下不变；
+          - 平面方程关于原点的全局缩放满足 d → factor·d (点云整体缩放时,
+            原内点仍满足 A·x' + B·y' + C·z' + factor·d = 0)；
+          - 凸包面积是二阶量，故 area → factor²·area。
+
+        :param factor: 线性比例尺因子，必须为正有限值
+        :return: self (便于链式调用)
+        """
+        if not np.isfinite(factor) or factor <= 0:
+            raise ValueError(f"非法的比例尺因子: {factor!r}，必须为正有限值")
+
+        if factor == 1.0:
+            return self
+
+        self.cloud.scale(factor, center=(0, 0, 0))
+
+        self.model = np.array([
+            self.model[0], self.model[1], self.model[2],
+            float(self.model[3]) * factor,
+        ])
+        self.centroid = np.asarray(self.centroid, dtype=float) * factor
+        self.area = float(self.area) * (factor ** 2)
+
+        try:
+            self.obb.scale(factor, center=(0, 0, 0))
+        except Exception:
+            # 个别 Open3D 版本对退化 OBB 的 scale 不稳健，退回复算
+            self.obb = self._compute_obb()
+
+        return self
+
     def __repr__(self):
         """打印对象时的友好格式"""
         a, b, c, d = self.model

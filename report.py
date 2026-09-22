@@ -56,7 +56,13 @@ class ReportGenerator:
             extra_metadata: Optional[Dict] = None,
     ) -> str:
         """
-        将检测结果与比例尺标定元数据导出为 JSON 报告
+        将检测结果与比例尺标定元数据导出为 JSON 报告。
+
+        前置条件 (由 IndustrialPipeline._to_physical_units 保证):
+        planes 的 cloud / model / centroid / area 与 vertices 均已处于物理单位 (mm)，
+        因此本方法**不再**做任何 scale_factor 补乘——旧实现在此处手工乘 factor，
+        与 main.py 中另外 5 处手工乘法互为隐式契约，任何一处漏改都会导致
+        "点云是物理单位、报表是虚拟单位"的静默错配。
         """
         file_path = self.out_dir / filename
 
@@ -66,7 +72,7 @@ class ReportGenerator:
 
         self.logger.info(f"开始生成 JSON 检验报告 (Scale Factor: {scale_factor:.6f}): {file_path} ...")
 
-        # 1. 结构化平面数据 (乘以 scale_factor 修正截距 d, 质心 centroid 与面积 area)
+        # 1. 结构化平面数据 (直接输出物理量，不做二次缩放)
         planes_data = []
         for p in planes:
             a, b, c, d = p.model.tolist()
@@ -77,22 +83,22 @@ class ReportGenerator:
                     "a": round(a, 6),
                     "b": round(b, 6),
                     "c": round(c, 6),
-                    "d": round(d * scale_factor, 6)  # 偏移量 d 随空间线性缩放
+                    "d": round(d, 6)
                 },
                 "point_count": len(p.cloud.points),
-                "estimated_area_mm2": round(p.area * (scale_factor ** 2), 6),  # 面积按平方缩放
+                "estimated_area_mm2": round(float(p.area), 6),
                 "centroid": [
-                    round(cx * scale_factor, 6),
-                    round(cy * scale_factor, 6),
-                    round(cz * scale_factor, 6)
+                    round(cx, 6),
+                    round(cy, 6),
+                    round(cz, 6)
                 ]
             })
 
-        # 2. 结构化顶点数据 (坐标按比例放大)
+        # 2. 结构化顶点数据 (直接输出物理坐标)
         vertices_data = []
         if len(vertices) > 0:
             for idx, v in enumerate(vertices):
-                vx, vy, vz = (v * scale_factor).tolist()
+                vx, vy, vz = np.asarray(v, dtype=float).tolist()
                 vertices_data.append({
                     "vertex_id": idx + 1,
                     "x": round(vx, 6),

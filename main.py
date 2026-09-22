@@ -161,16 +161,28 @@ class IndustrialPipeline:
         validate_input_file(self.args.input, allowed_exts=[".ply", ".pcd"])
         Path(self.args.out_dir).mkdir(parents=True, exist_ok=True)
 
-    @staticmethod
-    def _apply_scale_to_scene(planes, rest_pcd, factor):
+    @classmethod
+    def _to_physical_units(cls, planes, rest_pcd, vertices, factor):
         """
-        统一对场景内可变点云对象施加物理比例尺。
-        阶段 5 与阶段 5.5 (Auto-Scale) 共用此唯一入口，防止跨阶段重复/遗漏缩放。
+        将场景内所有几何一次性切换到物理单位 (mm)。全流水线唯一的尺度施加入口。
+
+        调用方必须用返回值回写 vertices (numpy 数组是值类型，函数内重新绑定不会
+        传递到调用方)。函数返回后:
+          - planes 中每个 Plane 的 cloud / model.d / centroid / area 均为物理单位
+          - rest_pcd 为物理单位
+          - vertices 为物理单位
+
+        阶段 5 与阶段 5.5 (Auto-Scale) 共用此入口，防止跨阶段重复缩放或遗漏——
+        旧实现只缩放 p.cloud 而不更新 model/centroid/area，迫使 report.py 与
+        main.py 在 6 处手工补乘 scale_factor，极易漏改。
         """
         for p in planes:
-            p.cloud.scale(factor, center=(0, 0, 0))
+            p.scale(factor)
         if rest_pcd is not None and not rest_pcd.is_empty():
             rest_pcd.scale(factor, center=(0, 0, 0))
+        if vertices is not None and len(vertices) > 0:
+            vertices = vertices * factor
+        return vertices
 
     def run(self):
         """执行主流水线逻辑"""
@@ -316,7 +328,9 @@ class IndustrialPipeline:
             # 1. 对融合后平面的点云与残余点云应用物理空间缩放
             #    Auto-Scale 挂起时 factor 必为 1.0 (占位)，显式跳过以避免与阶段 5.5 重复缩放
             if not self._auto_scale_pending:
-                self._apply_scale_to_scene(merged_planes, rest_pcd, scale_info.factor)
+                vertices = self._to_physical_units(
+                    merged_planes, rest_pcd, vertices, scale_info.factor
+                )
 
             # 2. 导出包含绝对真实物理尺寸的融合点云 fused.ply (专门用于 ICP 对齐比对)
             fused_ply_path = reporter.export_fused_ply(merged_planes, filename="fused.ply")
@@ -332,8 +346,7 @@ class IndustrialPipeline:
             # 4. 根据配置导出 STEP 格式 CAD 模型
             #    Auto-Scale 挂起时推迟到阶段 5.5 尺度估计完成后再导出，避免虚拟单位 STEP
             if self.args.export_cad and not self._auto_scale_pending:
-                scaled_vertices = vertices * scale_info.factor if len(vertices) > 0 else vertices
-                cad_path = reporter.export_step(scaled_vertices, merged_planes)
+                cad_path = reporter.export_step(vertices, merged_planes)
                 if cad_path:
                     self.logger.info(f"      [CAD模型] STEP 文件已保存至: {cad_path}")
                 else:
@@ -400,7 +413,9 @@ class IndustrialPipeline:
                     )
                     # 将估计比例尺施加到 scan 点云、平面点云与残余点云 (统一入口)
                     scan_pcd.scale(scale_est, center=(0, 0, 0))
-                    self._apply_scale_to_scene(merged_planes, rest_pcd, scale_est)
+                    vertices = self._to_physical_units(
+                        merged_planes, rest_pcd, vertices, scale_est
+                    )
                     # 以物理单位重新导出 fused.ply 与 report.json (导出方法内部记录路径)
                     reporter.export_fused_ply(merged_planes, filename="fused.ply")
                     reporter.export_json(
@@ -411,10 +426,9 @@ class IndustrialPipeline:
                         f"      [Auto-Scale] scale_factor={scale_est:.6f} mm/虚拟单位，"
                         f"已重新导出物理单位 fused.ply 与 report.json"
                     )
-                    # 阶段 5 被推迟的 STEP 导出: 按估计尺度重新计算并导出
+                    # 阶段 5 被推迟的 STEP 导出: vertices 已在 _to_physical_units 中转为物理单位
                     if self.args.export_cad:
-                        scaled_vertices = vertices * scale_info.factor if len(vertices) > 0 else vertices
-                        cad_path = reporter.export_step(scaled_vertices, merged_planes)
+                        cad_path = reporter.export_step(vertices, merged_planes)
                         if cad_path:
                             self.logger.info(f"      [CAD模型] STEP 文件已按估计比例尺导出: {cad_path}")
                         else:
@@ -422,13 +436,14 @@ class IndustrialPipeline:
                                 "      [CAD模型] STEP 未生成 (当前环境无 CAD B-Rep 后端)，其余报告不受影响"
                             )
 
-                # 4. 构建 datum 平面列表 (主基准面 → Datum A, 次基准面 → Datum B, 物理单位)
+                # 4. 构建 datum 平面列表 (主基准面 → Datum A, 次基准面 → Datum B)
+                #    merged_planes 已在 _to_physical_units 中切换为物理单位，此处不再补乘 scale_factor
                 datum_planes = []
                 datum_ids = {self.args.primary_plane_id, self.args.secondary_plane_id}
                 for p in merged_planes:
                     if p.id in datum_ids:
                         datum_planes.append(
-                            (np.array(p.normal, dtype=float), float(p.model[3]) * scale_info.factor)
+                            (np.array(p.normal, dtype=float), float(p.model[3]))
                         )
                 if self.args.datum_weight > 1.0:
                     if datum_planes:
@@ -495,11 +510,9 @@ class IndustrialPipeline:
                 feature_extractor = FeatureExtractor()
 
                 # 扫描特征
+                # merged_planes 已由 _to_physical_units 切换为物理单位，
+                # 因此 PlaneFeature 的 centroid / d / points 天然就是物理值，无需再补乘
                 scan_planes = feature_extractor.extract_planes_from_scan(merged_planes, source="scan")
-                # 点云已缩放，但 PlaneFeature 中的 centroid / d 仍为虚拟单位，需同步缩放
-                for sp in scan_planes:
-                    sp.centroid = sp.centroid * scale_info.factor
-                    sp.d = sp.d * scale_info.factor
 
                 scan_cylinders = []
                 if self.args.detect_cylinders:
@@ -510,8 +523,7 @@ class IndustrialPipeline:
                 scan_lines = feature_extractor.extract_lines_from_planes(
                     scan_planes, source_pcd=scan_pcd, edge_width=1.0
                 )
-                scaled_vertices_for_tol = vertices * scale_info.factor if len(vertices) > 0 else vertices
-                scan_points = feature_extractor.extract_points_from_array(scaled_vertices_for_tol, source="scan")
+                scan_points = feature_extractor.extract_points_from_array(vertices, source="scan")
 
                 # CAD 名义特征 (从对齐后的 CAD 点云提取)
                 cad_planes = feature_extractor.extract_planes_from_pcd(
@@ -574,8 +586,7 @@ class IndustrialPipeline:
                     )
                 else:
                     self.logger.info("[6/6] 正在启动 3D 可视化渲染引擎...")
-                    scaled_vertices = vertices * scale_info.factor if len(vertices) > 0 else vertices
-                    visualizer.draw_scene(merged_planes, scaled_vertices, rest_pcd)
+                    visualizer.draw_scene(merged_planes, vertices, rest_pcd)
             else:
                 self.logger.info("[6/6] 当前为批处理模式，已跳过 3D 渲染界面显示。")
 
