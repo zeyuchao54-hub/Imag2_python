@@ -1,0 +1,26 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv310/
+venv/
+
+# ---- 流水线运行产物（大文件且每次运行都变，不入库） ----
+# 日志
+logs/
+# 各类输出目录：outputs/ outputs_latest/ outputs_new*/ outputs_raw_3dgs/ ...
+outputs*/
+# 点云与 CAD 导出物
+*.ply
+*.step
+*.stl.bak
+
+# ---- 临时/诊断脚本输出 ----
+*.tmp
+*.log
+
+# ---- 操作系统与 IDE ----
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
