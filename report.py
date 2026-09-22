@@ -23,6 +23,21 @@ class ReportGenerator:
         # 确保输出目录存在
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("PointToCAD_System.Reporter")
+        # 本次运行实际写出的文件 (按首次写入顺序)。
+        # 用于综合报告的"输出文件清单"只列本次产物——旧实现直接遍历 out_dir，
+        # 复用旧的输出目录时会把上一次运行残留的文件一并列出，造成"产物齐备"的错觉。
+        self._written_files: "Dict[str, Path]" = {}
+
+    def _record_written(self, file_path) -> Optional[str]:
+        """记录一次成功的文件写入，返回原值以便链式调用。"""
+        if file_path:
+            path = Path(file_path)
+            self._written_files[str(path.resolve())] = path
+        return file_path or None
+
+    def list_written_files(self) -> List[Path]:
+        """返回本次运行实际写出的文件列表 (按写入顺序)。"""
+        return list(self._written_files.values())
 
     def export_fused_ply(self, planes: List[Plane], filename: str = "fused.ply") -> str:
         """
@@ -45,7 +60,7 @@ class ReportGenerator:
         o3d.io.write_point_cloud(str(file_path), combined_pcd)
         self.logger.info(f"fused.ply 成功保存！总点数: {len(combined_pcd.points)}")
 
-        return str(file_path.absolute())
+        return self._record_written(str(file_path.absolute()))
 
     def export_json(
             self,
@@ -130,7 +145,7 @@ class ReportGenerator:
             json.dump(report_content, f, indent=4, ensure_ascii=False)
 
         self.logger.info("JSON 报告导出成功！")
-        return str(file_path.absolute())
+        return self._record_written(str(file_path.absolute()))
 
     #: 可写出 STEP (B-Rep) 的 CAD 内核后端，按优先级排列。
     #: STEP 是边界表示格式，必须借助 OpenCASCADE 系内核，trimesh/numpy 均无法直接写出。
@@ -210,7 +225,7 @@ class ReportGenerator:
             json.dump(reg_result.to_dict(), f, indent=4, ensure_ascii=False)
 
         self.logger.info("配准报告导出成功！")
-        return str(file_path.absolute())
+        return self._record_written(str(file_path.absolute()))
 
     def export_deviation_json(
             self,
@@ -227,7 +242,7 @@ class ReportGenerator:
             json.dump(dev_result.to_dict(), f, indent=4, ensure_ascii=False)
 
         self.logger.info("偏差统计报告导出成功！")
-        return str(file_path.absolute())
+        return self._record_written(str(file_path.absolute()))
 
     def export_point_cloud(
             self,
@@ -246,7 +261,7 @@ class ReportGenerator:
 
         o3d.io.write_point_cloud(str(file_path), pcd)
         self.logger.info(f"点云导出成功！总点数: {len(pcd.points)}")
-        return str(file_path.absolute())
+        return self._record_written(str(file_path.absolute()))
 
     def export_tolerance_json(
             self,
@@ -267,7 +282,7 @@ class ReportGenerator:
             json.dump(content, f, indent=4, ensure_ascii=False)
 
         self.logger.info("公差报告导出成功！")
-        return str(file_path.absolute())
+        return self._record_written(str(file_path.absolute()))
 
     def export_inspection_summary(
             self,
@@ -525,11 +540,33 @@ class ReportGenerator:
         # ---------------------------------------------------------
         # 7. 输出文件清单
         # ---------------------------------------------------------
-        lines.append("--- 7. 输出文件清单 ---")
-        for f in sorted(self.out_dir.iterdir()):
-            if f.is_file():
+        lines.append("--- 7. 输出文件清单 (仅本次运行生成) ---")
+        # 本报告自身最后才落盘，此刻尚未记入 _written_files，显式补上
+        listing = self.list_written_files()
+        if str(file_path.resolve()) not in self._written_files:
+            listing = listing + [Path(file_path)]
+        for f in listing:
+            try:
                 size_kb = f.stat().st_size / 1024.0
-                lines.append(f"  {f.name:30s}  {size_kb:10.2f} KB")
+            except OSError:
+                size_kb = 0.0  # 本报告自身此刻尚未写入，大小为 0 属正常
+            lines.append(f"  {f.name:30s}  {size_kb:10.2f} KB")
+        if not listing:
+            lines.append("  (无)")
+        lines.append("")
+        # 若目录中存在本次未生成的文件，显式提示，避免误当成本次产物
+        try:
+            stale = [
+                f for f in sorted(self.out_dir.iterdir())
+                if f.is_file() and str(f.resolve()) not in self._written_files
+            ]
+        except OSError:
+            stale = []
+        if stale:
+            lines.append(f"  注: {self.out_dir} 中另有 {len(stale)} 个文件并非本次生成")
+            lines.append(f"      (属历史残留，如需干净目录请指定新的 --out_dir):")
+            for f in stale:
+                lines.append(f"      - {f.name}")
         lines.append("")
 
         lines.append(sep)
@@ -541,4 +578,4 @@ class ReportGenerator:
             f.write("\n".join(lines))
 
         self.logger.info(f"自动化综合检测报告生成成功: {file_path}")
-        return str(file_path.absolute())
+        return self._record_written(str(file_path.absolute()))
