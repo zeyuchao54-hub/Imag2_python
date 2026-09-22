@@ -326,6 +326,15 @@ class ReportGenerator:
             lines.append(f"识别角点数: {summary.get('total_vertices_found', 'N/A')}")
             lines.append(f"比例尺因子: {scale.get('factor', 'N/A')} mm/虚拟单位")
             lines.append(f"比例尺来源: {scale.get('reference', 'N/A')}")
+            repro = meta.get("reproducibility", {})
+            if repro.get("random_seed") is not None:
+                lines.append(f"随机种子: {repro['random_seed']} (同输入同种子结果可复现)")
+            if "table_filter" in meta:
+                tf = meta["table_filter"]
+                lines.append(
+                    f"桌面平面剔除: P{tf.get('removed_plane_id', '?')} "
+                    f"(面积 {tf.get('removed_plane_area', '?')})"
+                )
 
             planes = report_data.get("planes", [])
             if planes:

@@ -7,6 +7,17 @@ import os
 import io
 from pathlib import Path
 
+# ==========================================
+# OpenMP 线程数必须在此处、且必须在 import open3d 之前固定
+# ==========================================
+# Open3D 0.19 的 RANSAC (segment_plane / registration_ransac_based_on_feature_matching)
+# 在 OpenMP 多线程下存在竞态: 同一种子下连跑两次，平面内点数会漂移
+# (实测 fused.ply 上首面内点在 15956~16448 之间跳动)，导致 scale_factor、
+# fitness、覆盖率全部不可复现，PASS/FAIL 判定随之翻转——质检工具失去可追溯性。
+# OpenMP 运行时在首次加载共享库时读取该变量，故必须在 import open3d 之前设置。
+# 本流水线单次运行仅数秒，单线程化的性能损失可忽略。
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import numpy as np
 import open3d as o3d
 
@@ -153,6 +164,9 @@ class IndustrialPipeline:
                             help="CAD 引导裁剪的缓冲边距 (默认 20.0 mm)")
         parser.add_argument("--cad_crop_voxel", type=float, default=3.0,
                             help="CAD 引导裁剪前的聚类体素大小 (默认 3.0 mm)")
+        parser.add_argument("--seed", type=int, default=42,
+                            help="全局随机种子 (默认 42)。RANSAC/圆柱拟合/表面采样均为随机算法，"
+                                 "固定种子才能保证同一输入得到同一结果、报告可复现可追溯")
         return parser.parse_args()
 
     def _prepare_environment(self):
@@ -160,6 +174,34 @@ class IndustrialPipeline:
         self.logger.info("正在执行系统环境初始化与输入文件校验...")
         validate_input_file(self.args.input, allowed_exts=[".ply", ".pcd"])
         Path(self.args.out_dir).mkdir(parents=True, exist_ok=True)
+
+    def _seed_everything(self, seed: int):
+        """
+        固定全局随机种子，使整条流水线可复现。
+
+        随机性来源:
+          - Open3D 的 segment_plane / registration_ransac_based_on_feature_matching
+            → o3d.utility.random.seed()
+          - trimesh 的 CAD 表面采样 → 已改用显式 seed 参数 (见 cad_loader)
+          - Plane._compute_obb 的防退化抖动 / FeatureExtractor 的圆柱 RANSAC
+            → 各自使用独立的 seeded Generator
+        此前仅 trimesh 一侧被播种，导致同一输入连跑两次 scale_factor 会在
+        41.16~42.34 mm/虚拟单位之间漂移、fitness 在 0.22~0.36 之间漂移，
+        PASS/FAIL 判定随之翻转，质检工具失去可追溯性。
+        """
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise ValueError(f"--seed 必须为整数，收到: {seed!r}")
+        o3d.utility.random.seed(seed)
+        np.random.seed(seed)
+        self.logger.info(f"全局随机种子已固定: seed={seed} (相同输入将产生相同结果)")
+
+    def _build_extra_metadata(self) -> dict:
+        """汇总写入 report.json 的审计元数据 (桌面剔除记录 + 随机种子溯源)。"""
+        extra = {}
+        if self._table_filter_audit:
+            extra["table_filter"] = self._table_filter_audit
+        extra["reproducibility"] = {"random_seed": int(self.args.seed)}
+        return extra
 
     @classmethod
     def _to_physical_units(cls, planes, rest_pcd, vertices, factor):
@@ -191,6 +233,8 @@ class IndustrialPipeline:
         self.logger.info("==================================================")
 
         t_start = time.time()
+
+        self._seed_everything(self.args.seed)
 
         try:
             # ---------------------------------------------------------
@@ -339,7 +383,7 @@ class IndustrialPipeline:
             # 3. 导出 JSON 几何检验报表 (嵌入结构化的 ScaleInfo 标定元数据 + 桌面剔除审计)
             report_path = reporter.export_json(
                 merged_planes, vertices, scale_info=scale_info,
-                extra_metadata={"table_filter": self._table_filter_audit} if self._table_filter_audit else None,
+                extra_metadata=self._build_extra_metadata(),
             )
             self.logger.info(f"      [几何报表] JSON 报告已保存至: {report_path}")
 
@@ -420,7 +464,7 @@ class IndustrialPipeline:
                     reporter.export_fused_ply(merged_planes, filename="fused.ply")
                     reporter.export_json(
                         merged_planes, vertices, scale_info=scale_info,
-                        extra_metadata={"table_filter": self._table_filter_audit} if self._table_filter_audit else None,
+                        extra_metadata=self._build_extra_metadata(),
                     )
                     self.logger.info(
                         f"      [Auto-Scale] scale_factor={scale_est:.6f} mm/虚拟单位，"

@@ -1,6 +1,9 @@
 import numpy as np
 import open3d as o3d
 
+#: _compute_obb 防退化抖动使用的固定种子，保证 OBB 可复现
+_JITTER_SEED = 20240901
+
 
 class Plane:
     """
@@ -34,9 +37,12 @@ class Plane:
             return self.cloud.get_oriented_bounding_box()
         except RuntimeError:
             # CAD 点云可能完美共面，导致 qhull 失败。加入微小抖动后重试。
+            # 抖动必须可复现: 使用固定种子的局部 Generator，避免每次 Import/
+            # 每次运行的 OBB 都不同 (否则可视化与 report.json 无法稳定复现)。
+            rng = np.random.default_rng(_JITTER_SEED)
             jittered = o3d.geometry.PointCloud()
             pts = np.asarray(self.cloud.points)
-            noise = np.random.normal(0, 1e-6, pts.shape)
+            noise = rng.normal(0, 1e-6, pts.shape)
             jittered.points = o3d.utility.Vector3dVector(pts + noise)
             return jittered.get_oriented_bounding_box()
 

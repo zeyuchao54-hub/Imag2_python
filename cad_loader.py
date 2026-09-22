@@ -103,21 +103,24 @@ class CADLoader:
 
         :return: (points, normals)，均为 Nx3 numpy 数组
         """
-        # 固定随机种子以获得可复现结果
-        if self.seed is not None:
-            np.random.seed(self.seed)
-
+        # 固定随机种子以获得可复现结果。
+        # 通过 trimesh 的 seed 参数传入 (局部生效)，不再调用 np.random.seed()
+        # 污染全局 RNG —— 那会连带打乱后续所有 numpy 随机消费方的取值序列。
         try:
             if self.use_even_sampling:
                 self.logger.debug(f"使用 sample_surface_even 采样 {self.num_points} 点...")
-                points, face_indices = trimesh.sample.sample_surface_even(mesh, self.num_points)
+                points, face_indices = trimesh.sample.sample_surface_even(
+                    mesh, self.num_points, seed=self.seed
+                )
             else:
                 raise RuntimeError("Fallback to sample_surface")
         except Exception as e:
             self.logger.warning(
                 f"sample_surface_even 失败或禁用，退回到 sample_surface: {e}"
             )
-            points, face_indices = trimesh.sample.sample_surface(mesh, self.num_points)
+            points, face_indices = trimesh.sample.sample_surface(
+                mesh, self.num_points, seed=self.seed
+            )
 
         # 法向直接取对应 face 的法向
         face_normals = mesh.face_normals

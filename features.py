@@ -155,10 +155,14 @@ class FeatureExtractor:
                          distance_threshold: float = 1.0,
                          radius_limits: Tuple[float, float] = (1.0, 100.0),
                          source: str = "scan",
-                         ransac_iterations: int = 500) -> List[CylinderFeature]:
+                         ransac_iterations: int = 500,
+                         seed: int = 42) -> List[CylinderFeature]:
         """
         使用自定义 RANSAC 从点云中检测圆柱特征。
         当前 Open3D 0.19.0 不包含 segment_cylinder，因此使用轴采样 + 圆拟合实现。
+
+        :param seed: RANSAC 采样种子。固定种子保证同一输入得到同一组圆柱，
+                     使 tolerance.json 可复现、可追溯。
         """
         if pcd is None or len(pcd.points) < 100:
             return []
@@ -166,6 +170,7 @@ class FeatureExtractor:
         points = np.asarray(pcd.points)
         remaining_mask = np.ones(len(points), dtype=bool)
         cylinders = []
+        rng = np.random.default_rng(seed)
 
         for cyl_id in range(max_cylinders):
             remaining_idx = np.where(remaining_mask)[0]
@@ -174,7 +179,8 @@ class FeatureExtractor:
 
             remaining_points = points[remaining_idx]
             best_model = self._ransac_cylinder(
-                remaining_points, distance_threshold, radius_limits, ransac_iterations
+                remaining_points, distance_threshold, radius_limits, ransac_iterations,
+                rng=rng,
             )
             if best_model is None:
                 break
@@ -211,17 +217,22 @@ class FeatureExtractor:
                          points: np.ndarray,
                          distance_threshold: float,
                          radius_limits: Tuple[float, float],
-                         iterations: int = 500):
+                         iterations: int = 500,
+                         rng: Optional[np.random.Generator] = None):
         """
         自定义 RANSAC 圆柱拟合。
         策略: 随机采样两点确定轴线方向，将点投影到垂直平面后用代数圆拟合，统计内点。
+
+        :param rng: 随机数生成器。由 detect_cylinders 传入并跨多次检测复用，
+                    保证可复现; 为 None 时退化为固定种子 (而非不定态)。
         """
         if len(points) < 50:
             return None
 
         best = None
         best_inliers = 0
-        rng = np.random.default_rng()
+        if rng is None:
+            rng = np.random.default_rng(42)
 
         for _ in range(iterations):
             # 随机采样两个点定义轴线方向
