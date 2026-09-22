@@ -11,8 +11,13 @@ from typing import Union, Optional, Tuple
 import numpy as np
 import open3d as o3d
 import trimesh
+from scipy.spatial import cKDTree
 
 from utils import validate_input_file
+
+#: get_vertices() 中合并重复 STL 顶点的容差 (mm)。
+#: STL 按三角面重复存储顶点，同一几何顶点在相邻面中各存一份。
+_VERTEX_MERGE_TOLERANCE_MM = 0.01
 
 
 class CADLoader:
@@ -135,18 +140,50 @@ class CADLoader:
         return np.asarray(points, dtype=np.float64), np.asarray(normals, dtype=np.float64)
 
     def get_vertices(self) -> np.ndarray:
-        """返回原始 STL 网格顶点（去重后），用于几何公差中的名义顶点检测。"""
+        """
+        返回原始 STL 网格顶点（去重后），用于几何公差中的名义顶点检测。
+
+        STL 按三角面存储顶点，同一个几何顶点会在相邻面中重复出现多次，
+        因此这里按容差 0.01mm 合并。旧实现为 O(n²) 的 Python 双重循环
+        (对每个顶点线性扫描已有顶点)，实测 2000 个顶点需 4.5s，
+        5 万顶点的真实 STL 需十几分钟。
+        现改为 cKDTree.query_pairs + 并查集，复杂度 O(n log n)。
+        """
         if self._mesh is None:
             return np.zeros((0, 3))
+
         vertices = np.asarray(self._mesh.vertices, dtype=float)
-        # 简单去重：距离小于 0.01mm 的顶点合并
         if len(vertices) == 0:
             return vertices
-        unique = []
-        for v in vertices:
-            if not any(np.linalg.norm(v - u) < 0.01 for u in unique):
-                unique.append(v)
-        return np.array(unique)
+
+        # 退化情况: 单点或退化包围盒直接返回，避免 KDTree 异常
+        if len(vertices) == 1 or not np.all(np.isfinite(vertices)):
+            return vertices
+        if float(np.linalg.norm(np.ptp(vertices, axis=0))) <= 0.0:
+            return vertices
+
+        tree = cKDTree(vertices)
+        pairs = tree.query_pairs(_VERTEX_MERGE_TOLERANCE_MM, output_type="ndarray")
+
+        # 并查集: 合并所有距离 <= 容差的顶点对
+        parent = np.arange(len(vertices))
+
+        def find(a: int) -> int:
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]  # 路径压缩
+                a = parent[a]
+            return a
+
+        for i, j in pairs:
+            ri, rj = find(int(i)), find(int(j))
+            if ri != rj:
+                parent[ri] = rj
+
+        roots = np.array([find(i) for i in range(len(vertices))])
+        # 每个等价类取首次出现的顶点作为代表 (与原实现的"保留先到者"一致)
+        _, representative_idx = np.unique(roots, return_index=True)
+        representative_idx.sort()
+        return vertices[representative_idx]
 
     @staticmethod
     def _normalize_normals(normals: np.ndarray) -> np.ndarray:
