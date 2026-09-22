@@ -1,8 +1,9 @@
 import logging
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from scipy.spatial.transform import Rotation
 from plane import Plane
+from utils import diagonal_of
 
 
 class DatumAligner:
@@ -73,6 +74,99 @@ class DatumAligner:
         rot = Rotation.from_rotvec(axis * angle)
         return rot.as_matrix()
 
+    @staticmethod
+    def _solve_three_planes(pa: Plane, pb: Plane, pc: Plane) -> Optional[np.ndarray]:
+        """
+        求解三个平面的交点。矩阵奇异或结果非有限时返回 None。
+        """
+        A = np.array([pa.model[:3], pb.model[:3], pc.model[:3]], dtype=float)
+        b = -np.array([pa.model[3], pb.model[3], pc.model[3]], dtype=float)
+        try:
+            if abs(float(np.linalg.det(A))) < 1e-6:
+                return None
+            corner = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            return None
+        if not np.all(np.isfinite(corner)):
+            return None
+        return corner
+
+    def _resolve_datum_origin(
+        self,
+        planes: List[Plane],
+        plane_a: Plane,
+        plane_b: Plane,
+        vertices: np.ndarray,
+    ) -> Tuple[np.ndarray, str]:
+        """
+        解析 3-2-1 对齐的原点。
+
+        旧实现直接取 vertices[0] (推导出的第一个 CAD 角点)。问题在于该点的选取
+        取决于 graph 里三元组的枚举顺序与聚类顺序，并不保证落在三个基准面上；
+        结果是"原点被移走了，但主基准面并没有被推到 Z=0"——实测中主基准面对齐后
+        位于 Z=+30 而非 Z=0，3-2-1 只满足了旋转部分。
+
+        正确语义: 原点 = Datum A ∩ Datum B ∩ Datum C。只有同时落在主基准面上的点
+        才能在对齐后把主基准面压到 Z=0。
+
+        :return: (原点坐标, 来源说明)
+        """
+        # ---- 1. 优先: Datum A ∩ B ∩ C ----
+        # 第三基准面 C 的选取准则: 法向与 A/B 都不接近平行 (|n·nA| 与 |n·nB| 都较小)，
+        # 否则三平面近共线，求出的交点会跑到无穷远。
+        scene_diagonal = diagonal_of(
+            np.vstack([np.asarray(p.cloud.points) for p in planes])
+            if planes else np.zeros((0, 3))
+        )
+        scene_centroid = (
+            np.mean(np.vstack([np.asarray(p.cloud.points) for p in planes]), axis=0)
+            if planes else np.zeros(3)
+        )
+
+        tertiary = None
+        best_parallelism = float("inf")
+        for p in planes:
+            if p.id in (plane_a.id, plane_b.id):
+                continue
+            parallelism = max(
+                abs(float(np.dot(p.normal, plane_a.normal))),
+                abs(float(np.dot(p.normal, plane_b.normal))),
+            )
+            if parallelism < best_parallelism:
+                best_parallelism = parallelism
+                tertiary = p
+
+        # |dot| < 0.7 ≈ 与 A/B 的夹角均大于 45°，可构成稳定角点
+        if tertiary is not None and best_parallelism < 0.7:
+            corner = self._solve_three_planes(plane_a, plane_b, tertiary)
+            if corner is not None:
+                # 兜底: 交点不应远离场景 (近共线时会解出伪交点)
+                if np.linalg.norm(corner - scene_centroid) <= 5.0 * max(scene_diagonal, 1e-12):
+                    return corner, (
+                        f"Datum A∩B∩C (P{plane_a.id} ∩ P{plane_b.id} ∩ P{tertiary.id})"
+                    )
+                self.logger.warning(
+                    f"基准面交点 P{plane_a.id}∩P{plane_b.id}∩P{tertiary.id} 远离场景，弃用"
+                )
+        elif tertiary is not None:
+            self.logger.warning(
+                f"找不到与主/次基准面都足够正交的第三基准面 (最小 |n·n| = {best_parallelism:.3f})"
+            )
+
+        # ---- 2. 退化: 退回复用推导出的第一个角点 ----
+        if vertices is not None and len(vertices) > 0:
+            self.logger.warning(
+                "未能用三基准面交点定位原点，退化为使用首个推导角点 (主基准面可能不落在 Z=0)"
+            )
+            return np.asarray(vertices[0], dtype=float), "first derived vertex (fallback)"
+
+        # ---- 3. 最后退化: 主基准面质心 ----
+        self.logger.warning(
+            "未能用三基准面交点定位原点且无可用角点，退化为使用主基准面质心 "
+            "(主基准面可能不落在 Z=0)"
+        )
+        return np.asarray(plane_a.centroid, dtype=float), "primary plane centroid (fallback)"
+
     def align_to_datum(
             self,
             planes: List[Plane],
@@ -122,13 +216,13 @@ class DatumAligner:
             )
 
         # -------------------------------------------------------------
-        # Step 3: 平移对齐 - 将主角点或基准面中心平移至原点 (0, 0, 0)
+        # Step 3: 平移对齐 - 将三基准面交点平移至原点 (0, 0, 0)
+        # 只有交点同时落在主基准面上，对齐后主基准面才真正位于 Z=0
         # -------------------------------------------------------------
-        if len(vertices) > 0:
-            # 以第 1 个推导出来的角点作为绝对原点 (0, 0, 0)
-            origin_ref = vertices[0]
-        else:
-            origin_ref = plane_a.centroid
+        origin_ref, origin_source = self._resolve_datum_origin(
+            planes, plane_a, plane_b, vertices
+        )
+        self.logger.info(f"3-2-1 原点定位方式: {origin_source}")
 
         origin_transformed = R_total @ origin_ref
         t_total = -origin_transformed
@@ -164,5 +258,7 @@ class DatumAligner:
             p.normal = normal
             p.centroid = centroid
 
-        self.logger.info("基准坐标系对齐完成！原点已定位于首个 CAD 角点，主平面已对齐至 Z=0。")
+        self.logger.info(
+            f"基准坐标系对齐完成！原点定位于 {origin_source}，主基准面 P{plane_a.id} 已对齐至 Z=0。"
+        )
         return planes, aligned_vertices, T

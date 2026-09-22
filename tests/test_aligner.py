@@ -39,7 +39,8 @@ def _make_plane(plane_id, normal, offset, extent=40.0, n=800, jitter=0.01):
 
     cloud = o3d.geometry.PointCloud()
     cloud.points = o3d.utility.Vector3dVector(pts)
-    return Plane(plane_id=plane_id, model=[*normal, offset], cloud=cloud)
+    # 点位于 +normal*offset 一侧，故方程为 n.x + d = 0 且 d = -offset
+    return Plane(plane_id=plane_id, model=[*normal, -offset], cloud=cloud)
 
 
 class TestRotationBetweenVectors(unittest.TestCase):
@@ -111,11 +112,12 @@ class TestDatumAlignment(unittest.TestCase):
 
     def test_downward_facing_primary_plane_keeps_right_handed_frame(self):
         aligner = DatumAligner()
+        # jitter=0.0 → 理想共面几何，SVD 重新拟合应精确复现平面方程
         planes = [
-            _make_plane(1, [0, 0, -1], offset=-30.0),   # 主基准面法向朝下 → 旧代码必然反射
-            _make_plane(2, [1, 0, 0], offset=-20.0),
-            _make_plane(3, [0, 1, 0], offset=-10.0),
-            _make_plane(4, [0, 0, 1], offset=25.0),
+            _make_plane(1, [0, 0, -1], offset=-30.0, jitter=0.0),   # 主基准面法向朝下 → 旧代码必然反射
+            _make_plane(2, [1, 0, 0], offset=-20.0, jitter=0.0),
+            _make_plane(3, [0, 1, 0], offset=-10.0, jitter=0.0),
+            _make_plane(4, [0, 0, 1], offset=25.0, jitter=0.0),
         ]
         vertices = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]])
 
@@ -129,8 +131,33 @@ class TestDatumAlignment(unittest.TestCase):
         # 主基准面 (P1) 对齐后其法向应平行于 +Z
         n_z = abs(float(np.dot(aligned_planes[0].normal, [0, 0, 1])))
         self.assertGreater(n_z, 0.999)
-        # 注意: "主基准面恰好落在 Z=0" 还取决于原点的取法，
-        # 属于 #5 (3-2-1 原点取三基准面交点) 的范围，此处不断言。
+        # 次基准面 (P2) 对齐后其法向应平行于 +X
+        n_x = abs(float(np.dot(aligned_planes[1].normal, [1, 0, 0])))
+        self.assertGreater(n_x, 0.999)
+
+        # 3-2-1 的完整语义: 原点取三基准面交点后，主基准面必须恰好落在 Z=0。
+        # (#5 修复项——旧实现取 vertices[0]=[0,0,0]，主基准面对齐后位于 Z=+30)
+        self.assertAlmostEqual(float(aligned_planes[0].model[3]), 0.0, places=9,
+                               msg="主基准面对齐后未落在 Z=0，3-2-1 原点定位不正确")
+        self.assertAlmostEqual(float(aligned_planes[1].model[3]), 0.0, places=9,
+                               msg="次基准面对齐后未落在 X=0")
+
+    def test_datum_planes_land_on_zero_with_realistic_noise(self):
+        """带真实噪声时残差应远小于平面本身的偏移量 (修复前残差≈30)。"""
+        aligner = DatumAligner()
+        planes = [
+            _make_plane(1, [0, 0, -1], offset=-30.0, jitter=0.01),
+            _make_plane(2, [1, 0, 0], offset=-20.0, jitter=0.01),
+            _make_plane(3, [0, 1, 0], offset=-10.0, jitter=0.01),
+            _make_plane(4, [0, 0, 1], offset=25.0, jitter=0.01),
+        ]
+        aligned, _, _ = aligner.align_to_datum(
+            planes=planes, vertices=np.array([[0.0, 0.0, 0.0]]),
+            primary_plane_id=1, secondary_plane_id=2,
+        )
+        # 平面偏移量为 20~30，噪声引入的残差应在 1e-3 量级 (比修复前小 4 个数量级)
+        self.assertLess(abs(float(aligned[0].model[3])), 5e-3)
+        self.assertLess(abs(float(aligned[1].model[3])), 5e-3)
 
     def test_secondary_normal_pointing_minus_x(self):
         """次基准法向旋转后指向 -X 的路径。"""
@@ -160,6 +187,97 @@ class TestDatumAlignment(unittest.TestCase):
             primary_plane_id=1, secondary_plane_id=2
         )
         self.assertAlmostEqual(abs(float(np.linalg.det(T))), 1.0, places=9)
+
+
+class TestDatumOriginResolution(unittest.TestCase):
+    """#5: 3-2-1 原点必须取三基准面交点，并有明确回退链。"""
+
+    def setUp(self):
+        self.aligner = DatumAligner()
+
+    def test_origin_is_the_three_plane_intersection(self):
+        planes = [
+            _make_plane(1, [0, 0, 1], offset=0.0, extent=40.0),
+            _make_plane(2, [1, 0, 0], offset=-20.0, extent=40.0),
+            _make_plane(3, [0, 1, 0], offset=-10.0, extent=40.0),
+        ]
+        vertices = np.array([[999.0, 999.0, 999.0]])  # 显然不是正确原点
+
+        origin, source = self.aligner._resolve_datum_origin(planes, planes[0], planes[1], vertices)
+
+        # _make_plane 的约定: 点位于 +normal·offset，故方程为 n.x - offset = 0
+        #   P1: z = 0, P2: x = -20, P3: y = -10
+        self.assertTrue(np.allclose(origin, [-20.0, -10.0, 0.0], atol=1e-6),
+                        f"原点应为三面交点 (-20,-10,0)，实际 {origin}")
+        self.assertIn("A∩B∩C", source)
+
+    def test_origin_lies_on_both_datum_planes(self):
+        """原点必须同时满足主/次基准面方程——这是 3-2-1 正确性的核心。"""
+        planes = [
+            _make_plane(1, [0, 0, 1], offset=7.0, extent=30.0),
+            _make_plane(2, [1, 0, 0], offset=-13.0, extent=30.0),
+            _make_plane(3, [0, 1, 0], offset=-5.0, extent=30.0),
+        ]
+        origin, _ = self.aligner._resolve_datum_origin(planes, planes[0], planes[1], np.zeros((0, 3)))
+        for p in (planes[0], planes[1]):
+            residual = abs(float(np.dot(origin, p.model[:3]) + p.model[3]))
+            self.assertLess(residual, 1e-9, f"原点不在 P{p.id} 上 (残差 {residual})")
+
+    def test_falls_back_to_first_vertex_when_no_orthogonal_tertiary(self):
+        """所有其他面都与主/次基准面近平行时，退化为首个推导角点。"""
+        planes = [
+            _make_plane(1, [0, 0, 1], offset=0.0, extent=30.0),
+            _make_plane(2, [1, 0, 0], offset=-5.0, extent=30.0),
+            _make_plane(3, [0.02, 0, 1], offset=0.01, extent=30.0),   # 与 P1 近平行
+        ]
+        vertices = np.array([[3.0, 4.0, 5.0]])
+        origin, source = self.aligner._resolve_datum_origin(planes, planes[0], planes[1], vertices)
+        self.assertTrue(np.allclose(origin, [3.0, 4.0, 5.0]))
+        self.assertIn("fallback", source)
+
+    def test_falls_back_to_primary_centroid_when_no_vertices(self):
+        planes = [
+            _make_plane(1, [0, 0, 1], offset=0.0, extent=30.0),
+            _make_plane(2, [1, 0, 0], offset=-5.0, extent=30.0),
+            _make_plane(3, [0.02, 0, 1], offset=0.01, extent=30.0),
+        ]
+        origin, source = self.aligner._resolve_datum_origin(
+            planes, planes[0], planes[1], np.zeros((0, 3))
+        )
+        self.assertTrue(np.allclose(origin, np.asarray(planes[0].centroid), atol=1e-9))
+        self.assertIn("fallback", source)
+
+    def test_old_behaviour_would_leave_primary_off_z0(self):
+        """
+        回归锚点: 若沿用旧实现 (取一个不在主基准面上的点作原点)，
+        主基准面对齐后会被留在 Z≠0；新实现取三面交点则恰好为 0。
+
+        推导: 旋转把主基准面法向 n 转到 +Z 时平面截距 d_A 不变 (绕原点旋转
+        保持平面到原点距离)，随后按 t = -R·o 平移，新截距变为 d_A + n·o。
+        故原点 o 落在平面上 (n·o = -d_A) 时新截距恰为 0。
+        """
+        planes = [
+            _make_plane(1, [0, 0, 1], offset=-30.0, extent=40.0, jitter=0.0),
+            _make_plane(2, [1, 0, 0], offset=-20.0, extent=40.0, jitter=0.0),
+            _make_plane(3, [0, 1, 0], offset=-10.0, extent=40.0, jitter=0.0),
+        ]
+        origin_new, _ = self.aligner._resolve_datum_origin(
+            planes, planes[0], planes[1], np.zeros((0, 3))
+        )
+        origin_old = np.array([0.0, 0.0, 0.0])  # 远离主基准面 (z=-30) 的点
+
+        n_a = np.asarray(planes[0].normal, dtype=float)
+        d_a = float(planes[0].model[3])
+
+        # 新原点必须落在主基准面上 → 新截距为 0
+        self.assertLess(abs(float(np.dot(n_a, origin_new)) + d_a), 1e-9,
+                        "新原点不在主基准面上")
+        self.assertAlmostEqual(d_a + float(np.dot(n_a, origin_new)), 0.0, places=9,
+                               msg="新原点应使主基准面对齐后落在 Z=0")
+
+        # 旧原点不在主基准面上 → 新截距 = d_A = 30，明显偏离 Z=0
+        self.assertGreater(abs(d_a + float(np.dot(n_a, origin_old))), 1.0,
+                           "旧原点下主基准面应明显偏离 Z=0")
 
 
 if __name__ == "__main__":
