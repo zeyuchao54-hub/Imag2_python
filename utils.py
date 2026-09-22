@@ -5,6 +5,65 @@ from functools import wraps
 from pathlib import Path
 from typing import Union, List, Optional
 
+import numpy as np
+
+
+def diagonal_of(obj) -> float:
+    """
+    返回点云/点集的轴对齐包围盒 (AABB) 对角线长度，作为"场景物理尺度"的参照。
+
+    接受 open3d.geometry.PointCloud、Point3D 容器、或 (N,3) numpy 数组。
+    空输入返回 0.0 (不抛异常，便于调用方退化处理)。
+
+    用途: 模块内的距离类阈值原本是硬编码的绝对值 (如 0.05 / 0.02 / 50.0)，
+    隐含假设"点云尺度 ≈ 1 个单位"。这些数值在当前数据集上凑巧合适，
+    但换一台扫描仪或换一种规格的零件就会集体失效。改为以对角线的比例表达后，
+    阈值随数据自适应。
+    """
+    if obj is None:
+        return 0.0
+
+    if isinstance(obj, np.ndarray):
+        pts = obj
+    else:
+        # open3d 点云: 优先走 hasattr 判断，避免强依赖 open3d 类型
+        points_attr = getattr(obj, "points", None)
+        if points_attr is None:
+            return 0.0
+        pts = np.asarray(points_attr)
+
+    if pts.size == 0 or pts.ndim != 2 or pts.shape[0] == 0:
+        return 0.0
+
+    extent = np.ptp(pts, axis=0)
+    if not np.all(np.isfinite(extent)):
+        return 0.0
+    return float(np.linalg.norm(extent))
+
+
+def resolve_threshold(explicit: Optional[float],
+                      reference_diagonal: float,
+                      ratio: float,
+                      floor: float = 0.0,
+                      name: str = "threshold") -> float:
+    """
+    解析一个距离类阈值: 显式传入的绝对值优先，否则按 reference_diagonal × ratio 推导。
+
+    :param explicit: 调用方显式给定的绝对值; None 表示按比例自适应
+    :param reference_diagonal: 参照对角线长度
+    :param ratio: 相对于参照对角线的比例
+    :param floor: 下限，防止退化点云 (对角线≈0) 产生 0 阈值
+    :param name: 阈值名，仅用于异常信息
+    """
+    if explicit is not None:
+        if not np.isfinite(explicit) or explicit <= 0:
+            raise ValueError(f"{name} 必须为正有限值，收到: {explicit!r}")
+        return float(explicit)
+
+    if not np.isfinite(reference_diagonal) or reference_diagonal <= 0:
+        return float(floor)
+    return max(float(reference_diagonal) * float(ratio), float(floor))
+
 
 def time_it(func):
     """

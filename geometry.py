@@ -3,6 +3,7 @@ import numpy as np
 from typing import List
 from plane import Plane
 from graph import PlaneGraph
+from utils import diagonal_of, resolve_threshold
 
 
 class GeometryAnalyzer:
@@ -11,20 +12,58 @@ class GeometryAnalyzer:
     职责: 解析拓扑图，通过线性代数求解 CAD 角点，并进行空间聚类去重
     """
 
-    def __init__(self, cluster_tolerance=0.02, max_bound=50.0):
+    #: 顶点聚类容差相对于"全部平面点云对角线"的比例。
+    #: 旧实现硬编码 cluster_tolerance=0.02，隐含"点云尺度≈1"假设；
+    #: 该比例在当前参考数据集上复现原值，但换尺度/换零件时自适应。
+    CLUSTER_TOLERANCE_RATIO = 0.005
+
+    #: "幽灵交点"过滤边界 = 场景对角线 × 该倍数。
+    #: 三平面近于平行时会解出数十倍于零件的伪交点，需按场景尺度成比例剔除。
+    MAX_BOUND_RATIO = 13.0
+
+    def __init__(self, cluster_tolerance=None, max_bound=None,
+                 cluster_tolerance_ratio=None, max_bound_ratio=None):
         """
-        :param cluster_tolerance: 顶点聚类容差 (合并距离小于此值的重复角点，单位: 米)
-        :param max_bound: 异常点过滤边界 (剔除距离原点超过此数值的“幽灵交点”)
+        :param cluster_tolerance: 顶点聚类容差 (绝对单位)。默认 None → 按场景对角线比例自适应
+        :param max_bound: 异常点过滤边界 (绝对单位)。默认 None → 按场景对角线倍数自适应
+        :param cluster_tolerance_ratio: 覆盖默认聚类容差比例
+        :param max_bound_ratio: 覆盖默认边界倍数
         """
         self.logger = logging.getLogger("PointToCAD_System.Geometry")
         self.cluster_tolerance = cluster_tolerance
         self.max_bound = max_bound
+        self.cluster_tolerance_ratio = (
+            self.CLUSTER_TOLERANCE_RATIO if cluster_tolerance_ratio is None
+            else float(cluster_tolerance_ratio)
+        )
+        self.max_bound_ratio = (
+            self.MAX_BOUND_RATIO if max_bound_ratio is None
+            else float(max_bound_ratio)
+        )
 
     def compute_intersection_vertices(self, graph: PlaneGraph) -> np.ndarray:
         """
         根据拓扑图，计算所有有效的三面交点 (CAD 顶点)
         """
         self.logger.info("开始进行几何求交与顶点推导...")
+
+        # 0. 解析与场景尺度挂钩的容差 (旧实现为硬编码绝对值)
+        scene_diagonal = diagonal_of(
+            np.vstack([np.asarray(p.cloud.points) for p in graph.nodes.values()])
+            if graph.nodes else np.zeros((0, 3))
+        )
+        cluster_tol = resolve_threshold(
+            self.cluster_tolerance, scene_diagonal,
+            self.cluster_tolerance_ratio, floor=1e-12, name="geometry.cluster_tolerance",
+        )
+        max_bound = resolve_threshold(
+            self.max_bound, scene_diagonal,
+            self.max_bound_ratio, floor=1e-6, name="geometry.max_bound",
+        )
+        self.logger.debug(
+            f"顶点容差: cluster={cluster_tol:.6g}, max_bound={max_bound:.6g} "
+            f"(场景对角线 {scene_diagonal:.6g})"
+        )
 
         # 1. 从拓扑图中提取所有“两两互相垂直”的三面组合
         triplets = graph.find_perpendicular_triplets()
@@ -48,7 +87,7 @@ class GeometryAnalyzer:
 
             if vertex is not None:
                 # 过滤掉因为微小误差跑到“十万八千里”之外的非法坐标
-                if np.all(np.abs(vertex) < self.max_bound):
+                if np.all(np.abs(vertex) < max_bound):
                     raw_vertices.append(vertex)
 
         if not raw_vertices:
@@ -56,7 +95,7 @@ class GeometryAnalyzer:
             return np.array([])
 
         # 2. 对求解出的坐标进行空间聚类与去重
-        clean_vertices = self._cluster_vertices(raw_vertices)
+        clean_vertices = self._cluster_vertices(raw_vertices, cluster_tol)
 
         self.logger.info(f"顶点计算完成！共推导出 {len(clean_vertices)} 个有效 CAD 顶点。")
         for idx, v in enumerate(clean_vertices):
@@ -98,11 +137,14 @@ class GeometryAnalyzer:
             self.logger.debug("矩阵奇异，无法求解该三面组合的交点。")
             return None
 
-    def _cluster_vertices(self, vertices: List[np.ndarray]) -> List[np.ndarray]:
+    def _cluster_vertices(self, vertices: List[np.ndarray],
+                          cluster_tolerance: float) -> List[np.ndarray]:
         """
         顶点空间聚类算法
         由于 RANSAC 平面并非 100% 完美的理论平面，多个相近组合算出的角点可能存在微小偏差。
         该算法将距离小于 tolerance 的点平均化，融合成一个唯一的精准角点。
+
+        :param cluster_tolerance: 聚类容差，由 compute_intersection_vertices 按场景尺度解析
         """
         if not vertices:
             return []
@@ -113,7 +155,7 @@ class GeometryAnalyzer:
             found_cluster = False
             for i, center in enumerate(clustered):
                 # 如果当前点距离某个已存在的角点非常近
-                if np.linalg.norm(pt - center['coord']) < self.cluster_tolerance:
+                if np.linalg.norm(pt - center['coord']) < cluster_tolerance:
                     # 将它加入该聚类，并动态更新该聚类的平均坐标
                     center['points'].append(pt)
                     center['coord'] = np.mean(center['points'], axis=0)

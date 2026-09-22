@@ -3,6 +3,8 @@ import logging
 import open3d as o3d
 import numpy as np
 
+from utils import resolve_threshold
+
 
 class PointCloudPreprocessor:
     """
@@ -10,16 +12,30 @@ class PointCloudPreprocessor:
     职责: 加载点云 -> 自适应降采样 -> 统计去噪 -> 法向量估计
     """
 
-    def __init__(self, target_points=50000, nb_neighbors=30, std_ratio=2.0):
+    #: 法向估计搜索半径相对于点云对角线的比例。
+    #: 旧实现硬编码 radius=0.1，隐含"点云尺度≈1"假设。
+    #: 该比例在当前参考数据集 (fused.ply，对角线 3.73866) 上精确复现 0.1，
+    #: 保证阈值相对化这一改动不引入任何行为偏移。
+    NORMAL_RADIUS_RATIO = 0.0267476
+
+    def __init__(self, target_points=50000, nb_neighbors=30, std_ratio=2.0,
+                 normal_radius=None, normal_radius_ratio=None):
         """
         :param target_points: 期望降采样后的目标点数（用于自适应计算体素大小）
         :param nb_neighbors: 统计滤波时的邻域点数
         :param std_ratio: 统计滤波的标准差倍数阈值
+        :param normal_radius: 法向估计搜索半径 (绝对单位)。默认 None → 按点云对角线比例自适应
+        :param normal_radius_ratio: 覆盖默认的半径比例
         """
         self.logger = logging.getLogger("PointToCAD_System.Preprocessor")
         self.target_points = target_points
         self.nb_neighbors = nb_neighbors
         self.std_ratio = std_ratio
+        self.normal_radius = normal_radius
+        self.normal_radius_ratio = (
+            self.NORMAL_RADIUS_RATIO if normal_radius_ratio is None
+            else float(normal_radius_ratio)
+        )
 
     def process(self, file_path) -> o3d.geometry.PointCloud:
         """
@@ -104,9 +120,19 @@ class PointCloudPreprocessor:
         """
         self.logger.debug("开始计算点云法向量...")
 
-        # 搜索半径设定为平均点间距的几倍
+        # 搜索半径随点云尺度自适应 (旧实现为硬编码 0.1，隐含"点云尺度≈1"假设)
+        scene_diagonal = float(np.linalg.norm(
+            pcd.get_axis_aligned_bounding_box().get_extent()
+        ))
+        radius = resolve_threshold(
+            self.normal_radius, scene_diagonal,
+            self.normal_radius_ratio, floor=1e-9, name="preprocess.normal_radius",
+        )
+
         pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=radius, max_nn=self.nb_neighbors
+            )
         )
 
         # 统一法线朝向 (假设相机/扫描仪从外部观测，将法向指向外部)

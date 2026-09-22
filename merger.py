@@ -2,6 +2,7 @@ import logging
 import numpy as np
 import open3d as o3d
 from plane import Plane
+from utils import diagonal_of, resolve_threshold
 
 
 class PlaneMerger:
@@ -10,14 +11,37 @@ class PlaneMerger:
     职责: 基于法向量夹角和空间距离，将共面的“碎片平面”合并为单一的完整平面
     """
 
-    def __init__(self, angle_threshold=3.0, dist_threshold=0.05):
+    #: 共面距离容差相对于场景对角线的比例。
+    #: detector 用 0.008 × 对角线判定 RANSAC 内点；被同一方程吸收的两个碎片面，
+    #: 其间距不应显著大于该内点容差，故取约 1.7× (≈0.0134 × 对角线) 作为上界。
+    #: 该比例在当前参考数据集 (fused.ply，对角线 3.73862) 上精确复现原先硬编码的 0.05。
+    DIST_THRESHOLD_RATIO = 0.0133739
+
+    #: 接缝去重体素 = 平均点间距 ÷ 该系数。
+    #: 平均点间距 ≈ 对角线 / sqrt(点数)，故此规则同时与"场景尺度"和"点密度"解耦。
+    SEAM_VOXEL_SPACING_DIVISOR = 50.0
+
+    def __init__(self, angle_threshold=3.0, dist_threshold=None,
+                 dist_threshold_ratio=None, seam_voxel_divisor=None):
         """
         :param angle_threshold: 判定两个面共面的最大法向量夹角 (单位: 度)
-        :param dist_threshold: 判定两个面共面的最大平行截距差 (单位: 米/实际坐标系单位)
+        :param dist_threshold: 判定两个面共面的最大平行截距差 (绝对单位)。
+                               默认 None → 按 "场景对角线 × DIST_THRESHOLD_RATIO" 自适应，
+                               不再使用隐含"点云尺度≈1"假设的硬编码绝对值。
+        :param dist_threshold_ratio: 覆盖默认比例 (仅 dist_threshold 为 None 时生效)
+        :param seam_voxel_divisor: 覆盖接缝去重体素的分母 (默认 50)
         """
         self.logger = logging.getLogger("PointToCAD_System.Merger")
         self.angle_threshold = angle_threshold
         self.dist_threshold = dist_threshold
+        self.dist_threshold_ratio = (
+            self.DIST_THRESHOLD_RATIO if dist_threshold_ratio is None
+            else float(dist_threshold_ratio)
+        )
+        self.seam_voxel_divisor = (
+            self.SEAM_VOXEL_SPACING_DIVISOR if seam_voxel_divisor is None
+            else float(seam_voxel_divisor)
+        )
 
     def merge(self, raw_planes: list) -> list:
         """
@@ -39,6 +63,20 @@ class PlaneMerger:
 
         # 2. 按点数从大到小排序 (贪心策略: 总是以最大的面为基准去吸附小面)
         planes.sort(key=lambda p: len(p.cloud.points), reverse=True)
+
+        # 3. 解析共面距离容差: 显式绝对值优先，否则随场景尺度自适应
+        union_points = np.vstack([
+            np.asarray(p.cloud.points) for p in planes if len(p.cloud.points) > 0
+        ]) if any(len(p.cloud.points) > 0 for p in planes) else np.zeros((0, 3))
+        scene_diagonal = diagonal_of(union_points)
+        dist_thresh = resolve_threshold(
+            self.dist_threshold, scene_diagonal,
+            self.dist_threshold_ratio, floor=1e-12, name="merger.dist_threshold",
+        )
+        self.logger.debug(
+            f"共面距离容差: {dist_thresh:.6g} "
+            f"(场景对角线 {scene_diagonal:.6g} × {self.dist_threshold_ratio:g})"
+        )
 
         merged_planes = []
         used_indices = set()
@@ -62,7 +100,7 @@ class PlaneMerger:
                 target_plane = planes[j]
 
                 # 判断是否满足共面条件
-                if self._is_coplanar(base_plane, target_plane):
+                if self._is_coplanar(base_plane, target_plane, dist_thresh):
                     clouds_to_merge.append(target_plane.cloud)
                     used_indices.add(j)
                     merged_count += 1
@@ -156,11 +194,13 @@ class PlaneMerger:
 
         return planes, None, None
 
-    def _is_coplanar(self, plane_a: Plane, plane_b: Plane) -> bool:
+    def _is_coplanar(self, plane_a: Plane, plane_b: Plane, dist_threshold: float) -> bool:
         """
         核心判定逻辑: 检查两个平面是否为同一个物理平面
         条件 1: 法向夹角极小
         条件 2: A面的质心到B面的距离极小
+
+        :param dist_threshold: 共面距离容差，由 merge() 按场景尺度解析后传入
         """
         # 1. 检查法向夹角
         angle = plane_a.angle_with(plane_b)
@@ -169,10 +209,26 @@ class PlaneMerger:
 
         # 2. 检查空间距离 (用 B 面的质心到 A 面的方程距离来衡量)
         dist = plane_a.distance_to_point(plane_b.centroid)
-        if dist > self.dist_threshold:
+        if dist > dist_threshold:
             return False
 
         return True
+
+    @classmethod
+    def _seam_voxel_size(cls, combined: o3d.geometry.PointCloud) -> float:
+        """
+        计算拼接后的接缝去重体素尺寸 = 平均点间距 ÷ SEAM_VOXEL_SPACING_DIVISOR。
+
+        旧实现硬编码 voxel_down_sample(0.001)，同样隐含"点云尺度≈1"假设。
+        这里改为随尺度与密度自适应: 间距越密 → 体素越小，只剔除真正重叠的点，
+        不会把相邻的采样点错误合并。
+        """
+        n = len(combined.points)
+        scene_diagonal = diagonal_of(combined)
+        if n < 2 or scene_diagonal <= 0:
+            return 1e-9
+        spacing = scene_diagonal / np.sqrt(n)
+        return max(spacing / cls.SEAM_VOXEL_SPACING_DIVISOR, 1e-9)
 
     def _combine_point_clouds(self, clouds: list) -> o3d.geometry.PointCloud:
         """
@@ -182,8 +238,8 @@ class PlaneMerger:
         for c in clouds:
             combined += c
 
-        # 1. 轻量级体素降采样，剔除接缝处的重叠点
-        combined = combined.voxel_down_sample(voxel_size=0.001)
+        # 1. 轻量级体素降采样，剔除接缝处的重叠点 (体素随尺度/密度自适应)
+        combined = combined.voxel_down_sample(voxel_size=self._seam_voxel_size(combined))
 
         # 2. 统计滤波剔除明显离群点，防止相邻面的边缘飞点混入导致面积膨胀
         if len(combined.points) > 30:
