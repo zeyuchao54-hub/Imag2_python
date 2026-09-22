@@ -1,6 +1,12 @@
 """可复现性: 固定种子后，同一输入必须逐位复现。"""
 
 import os
+
+# 必须在 import open3d 之前固定 OpenMP 线程数，原因同 main.py:
+# Open3D 的 RANSAC 在多线程下有竞态。测试进程不能依赖"某个测试先 import 了 main"
+# 才顺带设置好环境变量——那也是此前本测试偶发失败的原因。
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import sys
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

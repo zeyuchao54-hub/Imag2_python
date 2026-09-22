@@ -276,6 +276,7 @@ class ReportGenerator:
             icp_init_method: str,
             total_time: float,
             tolerance_mm: float = 2.0,
+            angle_tolerance_deg: float = 2.0,
             filename: str = "inspection_report.txt"
     ) -> str:
         """
@@ -497,6 +498,14 @@ class ReportGenerator:
                 tol_data = json.load(f)
 
             lines.append("--- 6. 几何公差 (GD&T) ---")
+            lines.append(
+                f"  判定阈值 (分纲): 长度类 ±{tolerance_mm:.4g} mm | "
+                f"角度类 ±{angle_tolerance_deg:.4g} deg"
+            )
+            lines.append(
+                "  注: 各项算法为简化实现 (详见 tolerance.json 的 algorithm 字段)，"
+                "非 ISO 最小包容区域/最小外接圆的严格解"
+            )
             for category, results in tol_data.items():
                 if not results:
                     continue

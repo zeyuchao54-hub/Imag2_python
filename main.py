@@ -140,7 +140,10 @@ class IndustrialPipeline:
         parser.add_argument("--icp_fpfh_confidence", type=float, default=0.999,
                             help="FPFH RANSAC 置信度 (默认 0.999)")
         parser.add_argument("--tolerance", type=float, default=2.0,
-                            help="公差判定阈值 (默认 ±2.0 mm, 用于自动化检测报告中的 PASS/FAIL 判定)")
+                            help="长度类公差判定阈值 (默认 ±2.0 mm，用于平面度/圆柱度/位置度/轮廓度等)")
+        parser.add_argument("--angle_tolerance", type=float, default=2.0,
+                            help="角度类公差判定阈值 (默认 ±2.0 度，用于垂直度/平行度/倾斜度)。"
+                                 "与 --tolerance 量纲不同，二者独立配置")
         parser.add_argument("--detect_cylinders", action="store_true",
                             help="启用圆柱特征检测 (含孔/轴的零件可开启；纯平面零件建议关闭以避免假阳性)")
         # ---------------------------------------------------------
@@ -587,7 +590,8 @@ class IndustrialPipeline:
                 deviation_signed = dev_result.scan_to_cad_signed
 
                 tolerance_analyzer = ToleranceAnalyzer(
-                    tolerance_threshold_mm=self.args.tolerance
+                    tolerance_threshold_mm=self.args.tolerance,
+                    angle_threshold_deg=self.args.angle_tolerance,
                 )
                 tolerance_results = tolerance_analyzer.analyze(
                     scan_planes=scan_planes,
@@ -645,6 +649,7 @@ class IndustrialPipeline:
                 icp_init_method=self.args.icp_init_method if self.args.icp else "N/A",
                 total_time=t_total,
                 tolerance_mm=self.args.tolerance,
+                angle_tolerance_deg=self.args.angle_tolerance,
             )
             self.logger.info("      自动化报告生成完毕。")
 

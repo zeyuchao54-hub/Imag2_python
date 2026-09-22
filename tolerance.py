@@ -16,7 +16,13 @@ from features import PlaneFeature, CylinderFeature, LineFeature, PointFeature
 
 @dataclass
 class ToleranceResult:
-    """单条公差结果"""
+    """
+    单条公差结果
+
+    threshold 记录该项实际使用的判定阈值，使 tolerance.json 自描述——避免下游读者
+    误以为所有项都按同一个 ±2.0 mm 判定 (方向公差按角度、形状/位置/轮廓公差按长度，
+    两者量纲不同)。algorithm 标注该项的算法性质 (简化实现须显式说明)。
+    """
     name: str
     value: float
     nominal: Optional[float] = None
@@ -24,9 +30,11 @@ class ToleranceResult:
     status: str = "N/A"
     features: List[str] = field(default_factory=list)
     details: Dict = field(default_factory=dict)
+    threshold: Optional[float] = None
+    algorithm: Optional[str] = None
 
     def to_dict(self) -> Dict:
-        return {
+        out = {
             "name": self.name,
             "value": round(float(self.value), 6),
             "nominal": round(float(self.nominal), 6) if self.nominal is not None else None,
@@ -35,15 +43,40 @@ class ToleranceResult:
             "features": self.features,
             "details": self.details,
         }
+        if self.threshold is not None:
+            out["threshold"] = round(float(self.threshold), 6)
+        if self.algorithm is not None:
+            out["algorithm"] = self.algorithm
+        return out
 
 
 class ToleranceAnalyzer:
-    """几何公差分析器"""
+    """
+    几何公差分析器
 
-    def __init__(self, tolerance_threshold_mm: float = 2.0):
+    阈值分纲:
+      - 方向公差 (垂直度/平行度/倾斜度) 单位为度，使用 angle_threshold_deg;
+      - 形状/位置/轮廓公差单位为 mm，使用 tolerance_threshold_mm。
+    旧实现把 angle_threshold_deg 硬编码为 2.0 且不可配置，与长度阈值混在同一个
+    --tolerance 参数下，读者无法从报告判断每项实际用的是哪个阈值。
+    """
+
+    def __init__(self, tolerance_threshold_mm: float = 2.0,
+                 angle_threshold_deg: Optional[float] = None):
         self.logger = logging.getLogger("PointToCAD_System.Tolerance")
-        self.tolerance_threshold_mm = tolerance_threshold_mm
-        self.angle_threshold_deg = 2.0  # 方向公差默认阈值
+        self.tolerance_threshold_mm = self._validate(tolerance_threshold_mm,
+                                                     "tolerance_threshold_mm")
+        # 默认 2.0° 与原硬编码值一致，但现在可通过 --angle_tolerance 配置
+        self.angle_threshold_deg = self._validate(
+            angle_threshold_deg if angle_threshold_deg is not None else 2.0,
+            "angle_threshold_deg",
+        )
+
+    @staticmethod
+    def _validate(value: float, name: str) -> float:
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} 必须为正有限值，收到: {value!r}")
+        return float(value)
 
     # ------------------------------------------------------------------
     # Main entry
@@ -208,6 +241,8 @@ class ToleranceAnalyzer:
             nominal=0.0,
             unit="mm",
             status="PASS" if flatness <= self.tolerance_threshold_mm else "FAIL",
+            threshold=self.tolerance_threshold_mm,
+            algorithm="max-min range of best-fit plane (simplified; ISO 最小包容区域需迭代求解放置平面)",
             features=[f"Scan_Plane{scan_plane.id}", f"CAD_Plane{cad_plane.id}"],
             details={
                 "max_signed_dev": float(np.max(signed_dists)),
@@ -252,6 +287,8 @@ class ToleranceAnalyzer:
             nominal=0.0,
             unit="mm",
             status="PASS" if straightness <= self.tolerance_threshold_mm else "FAIL",
+            threshold=self.tolerance_threshold_mm,
+            algorithm="2 x max radial deviation (simplified; ISO 最小包容圆柱需迭代求解放置圆柱)",
             features=[f"Edge_P{line.plane_ids[0]}_P{line.plane_ids[1]}"],
             details={
                 "point_count": len(points),
@@ -289,6 +326,8 @@ class ToleranceAnalyzer:
             nominal=0.0,
             unit="mm",
             status="PASS" if circularity <= self.tolerance_threshold_mm else "FAIL",
+            threshold=self.tolerance_threshold_mm,
+            algorithm="radial range at mid-height section (simplified; ISO 圆度需最小包容圆)",
             features=[f"Scan_Cylinder{scan_cyl.id}", f"CAD_Cylinder{cad_cyl.id}"],
             details={
                 "mean_radius": float(np.mean(radii)),
@@ -322,6 +361,8 @@ class ToleranceAnalyzer:
             nominal=0.0,
             unit="mm",
             status="PASS" if cylindricity <= self.tolerance_threshold_mm else "FAIL",
+            threshold=self.tolerance_threshold_mm,
+            algorithm="radial range about fitted axis (simplified; ISO 圆柱度需最小包容圆柱)",
             features=[f"Scan_Cylinder{scan_cyl.id}", f"CAD_Cylinder{cad_cyl.id}"],
             details={
                 "mean_radius": float(np.mean(radii)),
@@ -346,6 +387,7 @@ class ToleranceAnalyzer:
             nominal=90.0,
             unit="deg",
             status="PASS" if deviation <= self.angle_threshold_deg else "FAIL",
+            threshold=self.angle_threshold_deg,
             features=[f"Plane{sp1.id}", f"Plane{sp2.id}"],
             details={"measured_angle": round(angle, 4)}
         )
@@ -363,6 +405,7 @@ class ToleranceAnalyzer:
             nominal=0.0,
             unit="deg",
             status="PASS" if angle <= self.angle_threshold_deg else "FAIL",
+            threshold=self.angle_threshold_deg,
             features=[f"Plane{sp1.id}", f"Plane{sp2.id}"],
             details={"measured_angle": round(angle, 4)}
         )
@@ -388,6 +431,7 @@ class ToleranceAnalyzer:
             nominal=round(float(angle_c), 4),
             unit="deg",
             status="PASS" if deviation <= self.angle_threshold_deg else "FAIL",
+            threshold=self.angle_threshold_deg,
             features=[f"Plane{sp1.id}", f"Plane{sp2.id}"],
             details={
                 "measured_angle": round(float(angle_s), 4),
@@ -409,6 +453,7 @@ class ToleranceAnalyzer:
             nominal=0.0,
             unit="mm",
             status="PASS" if dist <= self.tolerance_threshold_mm else "FAIL",
+            threshold=self.tolerance_threshold_mm,
             features=[f"Scan_Cylinder{scan_cyl.id}", f"CAD_Cylinder{cad_cyl.id}"],
             details={
                 "scan_center": scan_cyl.center.tolist(),
@@ -428,6 +473,7 @@ class ToleranceAnalyzer:
             nominal=0.0,
             unit="mm",
             status="PASS" if dist <= self.tolerance_threshold_mm else "FAIL",
+            threshold=self.tolerance_threshold_mm,
             features=[f"Scan_Vertex{scan_pt.id}", f"CAD_Vertex{cad_pt.id}"],
             details={
                 "scan_coord": scan_pt.coord.tolist(),
@@ -460,6 +506,8 @@ class ToleranceAnalyzer:
             nominal=0.0,
             unit="mm",
             status="PASS" if dist <= self.tolerance_threshold_mm else "FAIL",
+            threshold=self.tolerance_threshold_mm,
+            algorithm="shortest distance between two axes (simplified; 轴不平行时 ISO 需按公差带宽度定义)",
             features=[f"Cylinder{sc1.id}", f"Cylinder{sc2.id}"],
             details={
                 "axis1": axis1.tolist(),
@@ -490,6 +538,8 @@ class ToleranceAnalyzer:
             nominal=0.0,
             unit="mm",
             status="PASS" if symmetry <= self.tolerance_threshold_mm else "FAIL",
+            threshold=self.tolerance_threshold_mm,
+            algorithm="mid-plane offset along normal (simplified; ISO 对称度需最小包容平行面间距)",
             features=[f"Plane{sp1.id}", f"Plane{sp2.id}"],
             details={
                 "nominal_midplane": mid_cad.tolist(),
@@ -526,6 +576,8 @@ class ToleranceAnalyzer:
             nominal=0.0,
             unit="mm",
             status="PASS" if profile <= self.tolerance_threshold_mm else "FAIL",
+            threshold=self.tolerance_threshold_mm,
+            algorithm="max-min of signed deviation (simplified; ISO 面轮廓度需双向公差带)",
             features=["scan_surface"],
             details={
                 "max_deviation": max_dev,
