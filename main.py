@@ -243,7 +243,7 @@ class IndustrialPipeline:
             # ---------------------------------------------------------
             # 阶段 1: 点云预处理 (降采样 / 去噪 / 法向)
             # ---------------------------------------------------------
-            self.logger.info("[1/6] 正在进行点云预处理 (降采样 / 统计去噪 / 法向量估计)...")
+            self.logger.info("[1/7] 正在进行点云预处理 (降采样 / 统计去噪 / 法向量估计)...")
             t1 = time.time()
             preprocessor = PointCloudPreprocessor()
             pcd_clean = preprocessor.process(self.args.input)
@@ -253,7 +253,7 @@ class IndustrialPipeline:
             # 阶段 1.5: CAD 引导的扫描区域裁剪（当提供 STL 时自动启用）
             # ---------------------------------------------------------
             if self.args.stl and self.args.cad_crop:
-                self.logger.info("[1.5/6] 正在执行 CAD 引导的扫描区域裁剪...")
+                self.logger.info("[1.5/7] 正在执行 CAD 引导的扫描区域裁剪...")
                 t15 = time.time()
                 pcd_clean = crop_scan_to_cad_region(
                     scan_pcd=pcd_clean,
@@ -266,7 +266,7 @@ class IndustrialPipeline:
             # ---------------------------------------------------------
             # 阶段 2: RANSAC 多平面几何图元提取
             # ---------------------------------------------------------
-            self.logger.info("[2/6] 正在执行 RANSAC 平面图元提取...")
+            self.logger.info("[2/7] 正在执行 RANSAC 平面图元提取...")
             t2 = time.time()
             detector = RansacDetector()
             raw_planes, rest_pcd = detector.detect(pcd_clean)
@@ -275,7 +275,7 @@ class IndustrialPipeline:
             # ---------------------------------------------------------
             # 阶段 3: 碎片面融合与去重
             # ---------------------------------------------------------
-            self.logger.info("[3/6] 正在执行共面碎片融合...")
+            self.logger.info("[3/7] 正在执行共面碎片融合...")
             t3 = time.time()
             merger = PlaneMerger()
             merged_planes = merger.merge(raw_planes)
@@ -290,7 +290,7 @@ class IndustrialPipeline:
                 )
                 if table_plane is not None:
                     self.logger.info(
-                        f"[3.5/6] 疑似桌面平面已剔除 (面积 {table_plane.area:.2f})，其点云并入残余点云"
+                        f"[3.5/7] 疑似桌面平面已剔除 (面积 {table_plane.area:.2f})，其点云并入残余点云"
                     )
                     # 重编号导致基准面 ID 重绑定时显式告警 (审计详情写入 report.json)
                     removed_id = self._table_filter_audit["removed_plane_id"]
@@ -311,7 +311,7 @@ class IndustrialPipeline:
             # ---------------------------------------------------------
             # 阶段 4: 拓扑建图与 CAD 角点/顶点求解
             # ---------------------------------------------------------
-            self.logger.info("[4/6] 正在构建拓扑关系图与求解 CAD 角点...")
+            self.logger.info("[4/7] 正在构建拓扑关系图与求解 CAD 角点...")
             t4 = time.time()
             graph_builder = PlaneGraphBuilder()
             graph = graph_builder.build(merged_planes)
@@ -324,7 +324,7 @@ class IndustrialPipeline:
             # 阶段 4.5: 业务级物理比例尺标定 (Calibration Engine)
             # ---------------------------------------------------------
             if self.args.scale_factor is not None:
-                self.logger.info(f"[4.5/6] 使用命令行提供的比例尺因子: {self.args.scale_factor:.6f}")
+                self.logger.info(f"[4.5/7] 使用命令行提供的比例尺因子: {self.args.scale_factor:.6f}")
                 scale_info = ScaleInfo(
                     factor=self.args.scale_factor,
                     reference="CLI --scale_factor override",
@@ -334,7 +334,7 @@ class IndustrialPipeline:
                 )
             elif self.args.stl and self.args.icp:
                 # 当提供 STL 并启用 ICP 时，默认使用 Auto-Scale，无需手动指定比例尺
-                self.logger.info("[4.5/6] Auto-Scale 模式: 检测到 --stl + --icp，将自动估计全局比例尺，无需人工标定")
+                self.logger.info("[4.5/7] Auto-Scale 模式: 检测到 --stl + --icp，将自动估计全局比例尺，无需人工标定")
                 scale_info = ScaleInfo(
                     factor=1.0,
                     reference="Pending auto-scale (Sim3 ICP)",
@@ -342,17 +342,17 @@ class IndustrialPipeline:
                 )
                 self._auto_scale_pending = True
             elif not self.args.batch:
-                self.logger.info("[4.5/6] 启动交互式物理比例尺标定 Engine...")
+                self.logger.info("[4.5/7] 启动交互式物理比例尺标定 Engine...")
                 calibrator = ScaleCalibrator()
                 scale_info = calibrator.interactive_calibrate(vertices, merged_planes)
             else:
-                self.logger.info("[4.5/6] 批处理模式下未提供 STL/ICP，自动使用默认比例尺 (Scale Factor = 1.0)")
+                self.logger.info("[4.5/7] 批处理模式下未提供 STL/ICP，自动使用默认比例尺 (Scale Factor = 1.0)")
                 scale_info = ScaleInfo()
 
             # ---------------------------------------------------------
             # 阶段 4.8: 3-2-1 工业基准坐标系对齐 (Datum Alignment)   【位置 2】
             # ---------------------------------------------------------
-            self.logger.info("[4.8/6] 正在执行 3-2-1 工业基准坐标系对齐...")
+            self.logger.info("[4.8/7] 正在执行 3-2-1 工业基准坐标系对齐...")
             aligner = DatumAligner()
             merged_planes, vertices, T_matrix = aligner.align_to_datum(
                 planes=merged_planes,
@@ -368,7 +368,7 @@ class IndustrialPipeline:
             # ---------------------------------------------------------
             # 阶段 5: 物理尺度施加与文件导出
             # ---------------------------------------------------------
-            self.logger.info("[5/6] 正在按物理标定尺寸生成导出的检验文件...")
+            self.logger.info("[5/7] 正在按物理标定尺寸生成导出的检验文件...")
             t5 = time.time()
             reporter = ReportGenerator(out_dir=self.args.out_dir)
 
@@ -407,7 +407,7 @@ class IndustrialPipeline:
             # 阶段 5.5: CAD 加载、ICP 配准与偏差分析
             # ---------------------------------------------------------
             if self.args.stl and self.args.icp:
-                self.logger.info("[5.5/6] 启动 CAD → Scan ICP 配准与偏差分析...")
+                self.logger.info("[5.5/7] 启动 CAD → Scan ICP 配准与偏差分析...")
                 t_icp = time.time()
 
                 # 防御性校验
@@ -627,22 +627,22 @@ class IndustrialPipeline:
 
                 # 如果有 ICP 偏差结果，优先显示偏差色谱
                 if hasattr(self, "_icp_visualization_data") and self._icp_visualization_data:
-                    self.logger.info("[6/6] 正在启动偏差色谱 3D 渲染引擎...")
+                    self.logger.info("[6/7] 正在启动偏差色谱 3D 渲染引擎...")
                     visualizer.draw_deviation(
                         scan_colored=self._icp_visualization_data["scan_colored"],
                         cad_colored=self._icp_visualization_data["cad_colored"],
                     )
                 else:
-                    self.logger.info("[6/6] 正在启动 3D 可视化渲染引擎...")
+                    self.logger.info("[6/7] 正在启动 3D 可视化渲染引擎...")
                     visualizer.draw_scene(merged_planes, vertices, rest_pcd)
             else:
-                self.logger.info("[6/6] 当前为批处理模式，已跳过 3D 渲染界面显示。")
+                self.logger.info("[6/7] 当前为批处理模式，已跳过 3D 渲染界面显示。")
 
             # ---------------------------------------------------------
             # 阶段 7: 自动化综合检测报告生成
             # ---------------------------------------------------------
             t_total = time.time() - t_start
-            self.logger.info("[7/6] 正在生成自动化综合检测报告...")
+            self.logger.info("[7/7] 正在生成自动化综合检测报告...")
             reporter.export_inspection_summary(
                 input_file=self.args.input,
                 stl_file=self.args.stl,
