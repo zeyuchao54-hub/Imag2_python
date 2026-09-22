@@ -14,21 +14,61 @@ class DatumAligner:
     def __init__(self):
         self.logger = logging.getLogger("PointToCAD_System.Aligner")
 
-    def _get_rotation_matrix_between_vectors(self, vec1: np.ndarray, vec2: np.ndarray) -> np.ndarray:
-        """计算将向量 vec1 旋转到 vec2 的 3x3 旋转矩阵"""
-        v1 = vec1 / np.linalg.norm(vec1)
-        v2 = vec2 / np.linalg.norm(vec2)
+    #: 判定"同向/反向极点"的余弦容差。越接近 ±1，轴角分解越病态，必须走极点分支。
+    _POLE_COS_TOL = 1.0 - 1e-9
 
-        # 如果两向量几乎同向
-        if np.allclose(v1, v2, atol=1e-5):
+    @staticmethod
+    def _any_perpendicular(unit_vec: np.ndarray) -> np.ndarray:
+        """
+        返回任意一个与 unit_vec 正交的单位向量。
+
+        选取与 unit_vec 最不平行的世界坐标轴做叉积，保证数值稳定性。
+        """
+        world_axes = (
+            np.array([1.0, 0.0, 0.0]),
+            np.array([0.0, 1.0, 0.0]),
+            np.array([0.0, 0.0, 1.0]),
+        )
+        ref = min(world_axes, key=lambda a: abs(float(np.dot(a, unit_vec))))
+        axis = np.cross(unit_vec, ref)
+        norm = float(np.linalg.norm(axis))
+        if norm < 1e-12:
+            # 理论上不会发生 (min 已选中最不平行的轴)，保留兜底
+            axis = np.cross(unit_vec, np.array([0.0, 0.0, 1.0]))
+            norm = float(np.linalg.norm(axis))
+        return axis / norm
+
+    def _get_rotation_matrix_between_vectors(self, vec1: np.ndarray, vec2: np.ndarray) -> np.ndarray:
+        """
+        计算将向量 vec1 旋转到 vec2 的 3x3 旋转矩阵，保证 det(R) = +1 (纯旋转)。
+
+        历史缺陷: 旧实现在两向量反向时直接返回 -np.eye(3)，其行列式为 -1，
+        是一次镜像反射而非旋转，会把整个场景左右翻转 (基准面法向朝下、
+        或次基准法向绕 Z 转完后指向 -X 时都会命中)。
+        反向的正确旋转是绕任意一条垂直于 vec1 的轴旋转 π。
+        """
+        n1 = float(np.linalg.norm(vec1))
+        n2 = float(np.linalg.norm(vec2))
+        if n1 < 1e-12 or n2 < 1e-12:
+            self.logger.warning("基准对齐收到零向量，跳过该步旋转")
             return np.eye(3)
-        # 如果两向量反向
-        if np.allclose(v1, -v2, atol=1e-5):
-            return -np.eye(3)
+
+        v1 = np.asarray(vec1, dtype=float) / n1
+        v2 = np.asarray(vec2, dtype=float) / n2
+        cos_angle = float(np.clip(np.dot(v1, v2), -1.0, 1.0))
+
+        # 同向: 单位旋转
+        if cos_angle >= self._POLE_COS_TOL:
+            return np.eye(3)
+
+        # 反向 (或轴角分解已病态): 绕垂直轴转 π，结果必为正规旋转
+        if cos_angle <= -self._POLE_COS_TOL:
+            axis = self._any_perpendicular(v1)
+            return Rotation.from_rotvec(axis * np.pi).as_matrix()
 
         axis = np.cross(v1, v2)
         axis = axis / np.linalg.norm(axis)
-        angle = np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0))
+        angle = np.arccos(cos_angle)
 
         rot = Rotation.from_rotvec(axis * angle)
         return rot.as_matrix()
@@ -71,6 +111,15 @@ class DatumAligner:
             R_x = np.eye(3)
 
         R_total = R_x @ R_z
+
+        # 正规性校验: det(R) 必须为 +1。若为 -1 说明装配出了反射矩阵，
+        # 后续所有点云/平面都会被镜像翻转，属于不可静默吞掉的程序性错误。
+        det_R = float(np.linalg.det(R_total))
+        if not np.isclose(det_R, 1.0, atol=1e-6):
+            raise ValueError(
+                f"3-2-1 基准对齐装配出非正规旋转矩阵 (det={det_R:.6f})，"
+                f"该场景会被镜像反射，已中止。请检查主/次基准面 (P{primary_plane_id}/P{secondary_plane_id}) 的法向是否退化。"
+            )
 
         # -------------------------------------------------------------
         # Step 3: 平移对齐 - 将主角点或基准面中心平移至原点 (0, 0, 0)
