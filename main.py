@@ -4,10 +4,15 @@ import logging
 import time
 import sys
 import os
+import io
 from pathlib import Path
 
 import numpy as np
 import open3d as o3d
+
+# Windows 终端默认 GBK，强制 stdout 使用 UTF-8 以避免中文日志乱码/报错
+if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
 
 # ==========================================
 # 导入各个解耦的业务与功能模块
@@ -28,6 +33,7 @@ try:
     from deviation import DeviationAnalyzer
     from features import FeatureExtractor
     from tolerance import ToleranceAnalyzer
+    from cad_cropper import crop_scan_to_cad_region
 except ImportError as e:
     print(f"模块导入失败，请检查文件结构是否完整: {e}")
     sys.exit(1)
@@ -128,8 +134,8 @@ class IndustrialPipeline:
         # ---------------------------------------------------------
         # Datum-Weighted ICP / Auto-Scale / 缺失面防护参数
         # ---------------------------------------------------------
-        parser.add_argument("--auto_scale", action="store_true",
-                            help="通过 Sim3 ICP 自动估计全局比例尺 (需配合 --stl --icp)，跳过人工标定，实现全自动")
+        parser.add_argument("--auto_scale", action="store_true", default=None,
+                            help="保留兼容：提供 --stl + --icp 时 Auto-Scale 已默认启用；此标志无额外作用")
         parser.add_argument("--datum_weight", type=float, default=10.0,
                             help="Datum-Weighted ICP 基准区域对应点权重 (默认 10.0；设为 1.0 退化为标准 ICP)")
         parser.add_argument("--datum_dist_thresh", type=float, default=1.5,
@@ -140,6 +146,12 @@ class IndustrialPipeline:
                             help="保留疑似桌面的超大平行平面 (默认自动剔除以防护缺失面扫描)")
         parser.add_argument("--table_area_ratio", type=float, default=2.0,
                             help="桌面平面判定的最小面积比 (默认 2.0，即疑似桌面面积 ≥ 2× 平行零件面)")
+        parser.add_argument("--cad_crop", action="store_true",
+                            help="启用 CAD 引导的扫描区域裁剪（当扫描场景包含大量背景时建议开启）")
+        parser.add_argument("--cad_crop_margin", type=float, default=20.0,
+                            help="CAD 引导裁剪的缓冲边距 (默认 20.0 mm)")
+        parser.add_argument("--cad_crop_voxel", type=float, default=3.0,
+                            help="CAD 引导裁剪前的聚类体素大小 (默认 3.0 mm)")
         return parser.parse_args()
 
     def _prepare_environment(self):
@@ -176,6 +188,20 @@ class IndustrialPipeline:
             preprocessor = PointCloudPreprocessor()
             pcd_clean = preprocessor.process(self.args.input)
             self.logger.info(f"      预处理完成 -> 耗时: {time.time() - t1:.3f}s")
+
+            # ---------------------------------------------------------
+            # 阶段 1.5: CAD 引导的扫描区域裁剪（当提供 STL 时自动启用）
+            # ---------------------------------------------------------
+            if self.args.stl and self.args.cad_crop:
+                self.logger.info("[1.5/6] 正在执行 CAD 引导的扫描区域裁剪...")
+                t15 = time.time()
+                pcd_clean = crop_scan_to_cad_region(
+                    scan_pcd=pcd_clean,
+                    stl_path=self.args.stl,
+                    margin_mm=self.args.cad_crop_margin,
+                    voxel_mm=self.args.cad_crop_voxel,
+                )
+                self.logger.info(f"      CAD 裁剪完成 -> 耗时: {time.time() - t15:.3f}s")
 
             # ---------------------------------------------------------
             # 阶段 2: RANSAC 多平面几何图元提取
@@ -246,8 +272,9 @@ class IndustrialPipeline:
                     real_distance_mm=0.0,
                     virtual_distance=0.0,
                 )
-            elif self.args.auto_scale and self.args.stl and self.args.icp:
-                self.logger.info("[4.5/6] Auto-Scale 模式: 跳过人工标定，将在 ICP 阶段通过 Sim3 估计全局比例尺")
+            elif self.args.stl and self.args.icp:
+                # 当提供 STL 并启用 ICP 时，默认使用 Auto-Scale，无需手动指定比例尺
+                self.logger.info("[4.5/6] Auto-Scale 模式: 检测到 --stl + --icp，将自动估计全局比例尺，无需人工标定")
                 scale_info = ScaleInfo(
                     factor=1.0,
                     reference="Pending auto-scale (Sim3 ICP)",
@@ -255,15 +282,11 @@ class IndustrialPipeline:
                 )
                 self._auto_scale_pending = True
             elif not self.args.batch:
-                if self.args.auto_scale:
-                    self.logger.warning("--auto_scale 需同时提供 --stl 与 --icp，已忽略，转为交互标定。")
                 self.logger.info("[4.5/6] 启动交互式物理比例尺标定 Engine...")
                 calibrator = ScaleCalibrator()
                 scale_info = calibrator.interactive_calibrate(vertices, merged_planes)
             else:
-                if self.args.auto_scale:
-                    self.logger.warning("--auto_scale 需同时提供 --stl 与 --icp，已忽略，使用默认比例尺 1.0。")
-                self.logger.info("[4.5/6] 批处理模式下自动使用默认比例尺 (Scale Factor = 1.0)")
+                self.logger.info("[4.5/6] 批处理模式下未提供 STL/ICP，自动使用默认比例尺 (Scale Factor = 1.0)")
                 scale_info = ScaleInfo()
 
             # ---------------------------------------------------------

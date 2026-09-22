@@ -441,6 +441,47 @@ class ICPRegistrar:
             self.logger.debug(f"初始位姿评估失败: {e}")
             return -1.0
 
+    def _score_initial_transform(
+        self,
+        source: o3d.geometry.PointCloud,
+        target: o3d.geometry.PointCloud,
+        transform: np.ndarray,
+        src_extent: np.ndarray,
+        tgt_extent: np.ndarray,
+    ) -> Tuple[float, float, float]:
+        """
+        综合评估初始位姿：fitness + 尺寸一致性。
+
+        对 box-like 零件，source 与 target 的各边长应近似一一对应。
+        若某候选将 source 的短边对齐到 target 的长边，则 AABB 尺寸差异大，
+        会被惩罚，从而避免“长边对短边”的错误匹配。
+
+        :return: (score, fitness, dimension_diff)
+        """
+        fitness = self._evaluate_initial_transform(
+            source, target, transform, voxel_size=self.coarse_voxel_size
+        )
+        if fitness < 0:
+            return -1.0, -1.0, float("inf")
+
+        # 计算变换后 source 的 AABB，与 target AABB 比较尺寸
+        src_pts = np.asarray(source.points)
+        src_tf = (transform[:3, :3] @ src_pts.T).T + transform[:3, 3]
+        src_tf_extent = np.ptp(src_tf, axis=0)
+
+        # 忽略退化维度（extent 接近 0）
+        valid = (tgt_extent > 1e-3) & (src_tf_extent > 1e-3)
+        if not valid.any():
+            return fitness, fitness, 0.0
+
+        dim_diff = float(np.mean(np.abs(src_tf_extent[valid] - tgt_extent[valid]) / tgt_extent[valid]))
+
+        # 尺寸一致性惩罚：差异越大，fitness 折扣越多
+        # 当 dim_diff=0 时 penalty=1；dim_diff=0.5 时 penalty≈0.61；dim_diff=1.0 时 penalty≈0.37
+        penalty = np.exp(-2.0 * dim_diff)
+        score = fitness * penalty
+        return score, fitness, dim_diff
+
     def _plane_based_initial_alignment(
         self,
         source: o3d.geometry.PointCloud,
@@ -477,9 +518,9 @@ class ICPRegistrar:
             f"找到 Source 三平面组: {len(source_triplets)}, Target 三平面组: {len(target_triplets)}"
         )
 
-        best_fitness = -1.0
+        best_score = -1.0
         best_transform = np.eye(4)
-        eval_distance = max(self.coarse_max_corr, 5.0)
+        best_info = {}
 
         # 以 source 的第一组三平面为基准（通常是最显著的角点）
         src_trip = source_triplets[0]
@@ -488,6 +529,8 @@ class ICPRegistrar:
             [source_planes[i] for i in src_trip]
         )
         src_center = np.asarray(source.points).mean(axis=0)
+        src_extent = np.ptp(np.asarray(source.points), axis=0)  # 用于尺寸一致性检查
+        tgt_extent = np.ptp(np.asarray(target.points), axis=0)
 
         for tgt_trip in target_triplets:
             tgt_frame_base, _ = self._build_frame_from_planes(target_planes, tgt_trip)
@@ -517,8 +560,8 @@ class ICPRegistrar:
                             T_corner = np.eye(4)
                             T_corner[:3, :3] = R
                             T_corner[:3, 3] = t_corner
-                            fitness_corner = self._evaluate_initial_transform(
-                                source, target, T_corner, voxel_size=self.coarse_voxel_size
+                            score_corner, fitness_corner, dim_diff_corner = self._score_initial_transform(
+                                source, target, T_corner, src_extent, tgt_extent
                             )
 
                             # 候选 2: 对齐质心
@@ -526,24 +569,35 @@ class ICPRegistrar:
                             T_center = np.eye(4)
                             T_center[:3, :3] = R
                             T_center[:3, 3] = t_center
-                            fitness_center = self._evaluate_initial_transform(
-                                source, target, T_center, voxel_size=self.coarse_voxel_size
+                            score_center, fitness_center, dim_diff_center = self._score_initial_transform(
+                                source, target, T_center, src_extent, tgt_extent
                             )
 
-                            for fitness, T, mode in [
-                                (fitness_corner, T_corner, "corner"),
-                                (fitness_center, T_center, "center"),
+                            for score, fitness, dim_diff, T, mode in [
+                                (score_corner, fitness_corner, dim_diff_corner, T_corner, "corner"),
+                                (score_center, fitness_center, dim_diff_center, T_center, "center"),
                             ]:
-                                if fitness > best_fitness:
-                                    best_fitness = fitness
+                                if score > best_score:
+                                    best_score = score
                                     best_transform = T
+                                    best_info = {
+                                        "fitness": fitness,
+                                        "dim_diff": dim_diff,
+                                        "perm": perm,
+                                        "signs": (sx, sy, sz),
+                                        "mode": mode,
+                                    }
                                     self.logger.debug(
-                                        f"新的最佳候选: fitness={fitness:.4f}, "
-                                        f"perm={perm}, signs=({sx},{sy},{sz}), mode={mode}"
+                                        f"新的最佳候选: score={score:.4f}, fitness={fitness:.4f}, "
+                                        f"dim_diff={dim_diff:.3f}, perm={perm}, signs=({sx},{sy},{sz}), mode={mode}"
                                     )
 
-        self.logger.info(f"Plane-based 最佳候选 fitness={best_fitness:.4f}")
-        return best_transform if best_fitness > 0 else None
+        if best_info:
+            self.logger.info(
+                f"Plane-based 最佳候选 fitness={best_info['fitness']:.4f}, "
+                f"尺寸一致性误差={best_info['dim_diff']:.3f}, perm={best_info['perm']}, mode={best_info['mode']}"
+            )
+        return best_transform if best_score > 0 else None
 
     def _extract_planes_for_alignment(self, pcd: o3d.geometry.PointCloud) -> List[dict]:
         """迭代 RANSAC 提取平面，返回归一化后的平面列表。"""
@@ -918,19 +972,22 @@ class ICPRegistrar:
         scan_pcd: o3d.geometry.PointCloud,
         cad_pcd: o3d.geometry.PointCloud,
         max_iterations: int = 30,
-        gate_ratio: float = 0.12,
+        gate_ratio: float = 0.03,
         min_correspondences: int = 100,
+        max_scale_correction: float = 0.15,
     ) -> float:
         """
-        通过 Sim3 (相似变换) ICP 自动估计 scan(虚拟单位) → CAD(物理单位) 的全局比例尺,
-        取代人工交互式标定，实现全自动尺度标定。
+        自动估计 scan(虚拟单位) → CAD(物理单位) 的全局比例尺，取代人工交互式标定。
 
-        流程: bbox 对角线初值 s0 → 初始刚性位姿 (与 register 共用统一分发) →
-              迭代最近邻 + Weighted Umeyama 闭式解, 同时优化 s / R / t。
+        策略:
+        1. 用 bbox 对角线比值得到稳健初值 s0（对立方体/法兰等刚体通常已很准）
+        2. 将 scan 缩放到近似 mm 空间后，执行刚性 ICP 获得初始位姿
+        3. 仅对近距离对应点 (< fine_max_corr) 做一次保守的 scale 微调，
+           且限制修正幅度不超过 max_scale_correction，防止错误对应把比例尺拉偏
 
         :return: scale_factor [mm/虚拟单位]
         """
-        self.logger.info("[Auto-Scale] 开始 Sim3 全局比例尺估计 (scan 虚拟单位 → CAD 物理单位)...")
+        self.logger.info("[Auto-Scale] 开始自动全局比例尺估计 (scan 虚拟单位 → CAD 物理单位)...")
 
         scan_diag = float(np.linalg.norm(scan_pcd.get_axis_aligned_bounding_box().get_extent()))
         cad_diag = float(np.linalg.norm(cad_pcd.get_axis_aligned_bounding_box().get_extent()))
@@ -951,51 +1008,49 @@ class ICPRegistrar:
         t_init, init_name = self._initial_alignment(scan_d, cad_d)
         self.logger.info(f"[Auto-Scale] 初始位姿方法: {init_name}")
 
-        # 3. 迭代最近邻 + Weighted Umeyama, 同时优化 scale / R / t
+        # 3. 运行一次粗 ICP（仅刚性，固定 scale=1），获得可靠位姿
+        result_coarse = self._run_icp(
+            source=scan_d,
+            target=cad_d,
+            init_transform=t_init,
+            max_correspondence_distance=self.coarse_max_corr,
+            max_iterations=self.coarse_max_iter,
+        )
+        T_rigid = np.asarray(result_coarse.transformation)
+        self.logger.info(
+            f"[Auto-Scale] 刚性粗 ICP: fitness={result_coarse.fitness:.4f}, rmse={result_coarse.inlier_rmse:.4f}"
+        )
+
+        # 4. 在细对应距离门限内，用 Weighted Umeyama 做保守 scale 微调
         src_pts = np.asarray(scan_d.points)
         tgt_pts = np.asarray(cad_d.points)
         tree = cKDTree(tgt_pts)
-        gate = max(self.coarse_max_corr, gate_ratio * cad_diag)
+        gate = max(self.fine_max_corr, gate_ratio * cad_diag)
 
-        T = np.array(t_init, dtype=np.float64)
+        src_tf = src_pts @ T_rigid[:3, :3].T + T_rigid[:3, 3]
+        dists, idx = tree.query(src_tf)
+        inl = dists <= gate
+        n_in = int(inl.sum())
         s_rel = 1.0
-        for it in range(max_iterations):
-            src_tf = src_pts @ T[:3, :3].T + T[:3, 3]
-            dists, idx = tree.query(src_tf)
-            inl = dists <= gate
-            n_in = int(inl.sum())
-            if n_in < min_correspondences:
-                self.logger.warning(f"[Auto-Scale] 第 {it + 1} 轮对应点不足 ({n_in})，提前终止")
-                break
-            s_new, R_new, t_new = self.weighted_umeyama(src_pts[inl], tgt_pts[idx[inl]])
-            if s_new <= 0:
-                # 非法尺度 (反射): 保持 T 不变并终止, 由下方回退逻辑处理
-                self.logger.warning(f"[Auto-Scale] 第 {it + 1} 轮尺度非正 (s={s_new:.4f})，提前终止迭代")
-                s_rel = s_new
-                break
-            ds = abs(s_new - s_rel)
-            dt = float(np.linalg.norm(t_new - T[:3, 3]))
-            T = np.eye(4)
-            T[:3, :3] = s_new * R_new
-            T[:3, 3] = t_new
-            s_rel = s_new
-            self.logger.debug(f"[Auto-Scale] iter {it + 1}: s_rel={s_rel:.6f}, inliers={n_in}")
-            if ds < 1e-7 and dt < 1e-4 * cad_diag:
-                break
 
-        if s_rel <= 0:
-            self.logger.warning(f"[Auto-Scale] 收敛到非法尺度 s_rel={s_rel:.4f}，回退到 bbox 初值 s0")
-            s_rel = 1.0
-        if abs(s_rel - 1.0) > 0.3:
+        if n_in >= min_correspondences:
+            s_new, _, _ = self.weighted_umeyama(src_pts[inl], tgt_pts[idx[inl]])
+            # 将修正量限制在 [1 - max_scale_correction, 1 + max_scale_correction]
+            s_new = float(np.clip(s_new, 1.0 - max_scale_correction, 1.0 + max_scale_correction))
+            if s_new > 0:
+                s_rel = s_new
+                self.logger.info(f"[Auto-Scale] 细对应 scale 微调: s_rel={s_rel:.6f} (n_in={n_in})")
+            else:
+                self.logger.warning(f"[Auto-Scale] 微调尺度非正 (s={s_new:.4f})，放弃修正")
+        else:
             self.logger.warning(
-                f"[Auto-Scale] 尺度相对 bbox 初值修正幅度过大 (s_rel={s_rel:.4f})，"
-                f"建议核对初始位姿或改用 --scale_factor"
+                f"[Auto-Scale] 细对应点不足 ({n_in} < {min_correspondences})，放弃 scale 微调，使用 bbox 初值"
             )
 
         scale_factor = s0 * s_rel
         self.logger.info(
             f"[Auto-Scale] 完成: scale_factor = {scale_factor:.6f} mm/虚拟单位 "
-            f"(s0={s0:.4f} × 收敛修正 {s_rel:.6f})"
+            f"(s0={s0:.4f} × 保守修正 {s_rel:.6f})"
         )
         return scale_factor
 
