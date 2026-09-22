@@ -121,15 +121,32 @@ class TestDeviationVectorization(unittest.TestCase):
         tn /= np.linalg.norm(tn, axis=1, keepdims=True)
 
         az = DeviationAnalyzer()
-        t0 = time.perf_counter()
+
+        def best_of(fn, repeats):
+            """取多次重复中的最小耗时: 上界噪声 (调度抖动/GC) 只可能抬高耗时，
+            最小值才是算法本身的真实代价。单次采样曾因瞬时抖动把向量化耗时抬高
+            7 倍而导致本测试偶发失败。"""
+            best = float("inf")
+            for _ in range(repeats):
+                t0 = time.perf_counter()
+                fn()
+                best = min(best, time.perf_counter() - t0)
+            return max(best, 1e-9)
+
+        t_vec = best_of(
+            lambda: az._compute_one_direction(_cloud(src, n), _cloud(tgt, tn), True),
+            repeats=5,
+        )
+        t_ref = best_of(
+            lambda: _reference_one_direction(src, n, tgt, tn, True),
+            repeats=3,
+        )
+
+        # 等价性粗校验 (精确对比由上面的 400 点用例负责)
         s_vec, _ = az._compute_one_direction(_cloud(src, n), _cloud(tgt, tn), True)
-        t_vec = max(time.perf_counter() - t0, 1e-9)
-
-        t0 = time.perf_counter()
         s_ref, _ = _reference_one_direction(src, n, tgt, tn, True)
-        t_ref = max(time.perf_counter() - t0, 1e-9)
-
         self.assertTrue(np.allclose(s_vec, s_ref, atol=1e-10))
+
         # 实测约 100 倍加速，阈值取 5 倍留有充足余量
         self.assertLess(t_vec, t_ref / 5.0,
                         f"向量化 {t_vec:.4f}s 未显著快于逐点 {t_ref:.4f}s")

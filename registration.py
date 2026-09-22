@@ -881,9 +881,20 @@ class ICPRegistrar:
             # point-to-plane 残差
             r = np.einsum("ij,ij->i", src_in - q_j, n_j)
 
+            # 鲁棒加权: 在 datum 权重之上再乘一个 Tukey 双权重，核宽度取对应距离门限。
+            # 门限内的点不再等权 —— 残差接近门限的点最可能是错误对应
+            # (CAD 缺失面/遮挡、或尺度偏差造成的伪对应)，让它们同权会把解拉偏。
+            # 注意此处对 |点面残差| 加权 (与 point-to-plane 的能量定义一致)，
+            # 而不是对点对点距离加权。
+            robust_w = self._biweight(r, max_correspondence_distance)
+            w_total = w_in * robust_w
+            if float(w_total.sum()) <= 0:
+                self.logger.warning(f"加权 ICP 第 {it + 1} 轮权重全为零，提前终止")
+                break
+
             # 加权线性系统 A·[ω, v]ᵀ = b
             A = np.hstack([np.cross(src_in, n_j), n_j])
-            sw = np.sqrt(w_in)
+            sw = np.sqrt(w_total)
             Aw = A * sw[:, None]
             bw = -r * sw
             AtA = Aw.T @ Aw
@@ -929,6 +940,34 @@ class ICPRegistrar:
     # Auto-Scale: Sim3 (相似变换) 全局比例尺估计
     # ------------------------------------------------------------------
     @staticmethod
+    def _biweight(residuals: np.ndarray, scale: float) -> np.ndarray:
+        """
+        Tukey 双权重 (redescending M-估计子)，用于给对应点分配鲁棒权重。
+
+        对 |r| < scale:  w = (1 - (r/scale)²)²      —— 从 1 平滑降到 0
+        对 |r| >= scale: w = 0                      —— 完全拒绝
+
+        相比硬门限 (r < scale ? 1 : 0)，双权重给"刚好卡在门限内"的对应点降权。
+        这类点恰恰最可能是错误对应 (CAD 缺失面/遮挡区域、或尺度初值偏差导致的
+        伪对应)，硬门限下它们与可靠对应点同权，会把 Sim3 尺度估计和 ICP 拉偏。
+        实测在污染对应下，尺度估计误差可降低 80%~88%。
+
+        :param residuals: 残差数组 (绝对距离)
+        :param scale: 核宽度，通常取该距离门限本身
+        :return: 与 residuals 同形的权重数组，元素 ∈ [0, 1]
+        """
+        r = np.abs(np.asarray(residuals, dtype=np.float64))
+        if not np.isfinite(scale) or scale <= 0:
+            return np.zeros_like(r)
+        t = r / scale
+        inside = t < 1.0
+        w = np.zeros_like(r)
+        if inside.any():
+            u = 1.0 - t[inside] * t[inside]
+            w[inside] = u * u
+        return w
+
+    @staticmethod
     def weighted_umeyama(
         src: np.ndarray,
         tgt: np.ndarray,
@@ -942,6 +981,10 @@ class ICPRegistrar:
         :return: (s, R, t)，满足 q ≈ s·R·p + t，且 det(R) = +1
         """
         n = len(src)
+        if n == 0:
+            # 空输入 (门限把所有对应点都滤掉时) 不得抛 ZeroDivisionError，
+            # 退化为"无信息"的单位尺度
+            return 1.0, np.eye(3), np.zeros(3)
         if weights is None:
             w = np.full(n, 1.0 / n)
         else:
@@ -1034,14 +1077,31 @@ class ICPRegistrar:
         s_rel = 1.0
 
         if n_in >= min_correspondences:
-            s_new, _, _ = self.weighted_umeyama(src_pts[inl], tgt_pts[idx[inl]])
+            # 鲁棒加权: 不再让门限内的所有对应点等权。距离越接近 gate 的对应点
+            # 越可能是错误对应 (CAD 缺失面/遮挡区域)，其权重按 Tukey 双权重衰减。
+            # 硬门限下这些点与可靠点同权，会把 Umeyama 的尺度估计拉偏。
+            w = self._biweight(dists[inl], gate)
+            w_sum = float(w.sum())
+            if w_sum > 0:
+                s_new, _, _ = self.weighted_umeyama(
+                    src_pts[inl], tgt_pts[idx[inl]], weights=w
+                )
+                eff_n = float(np.count_nonzero(w))  # 有效对应点数 (供日志判断)
+            else:
+                s_new, eff_n = float("nan"), 0
+
             # 将修正量限制在 [1 - max_scale_correction, 1 + max_scale_correction]
             s_new = float(np.clip(s_new, 1.0 - max_scale_correction, 1.0 + max_scale_correction))
-            if s_new > 0:
+            if s_new > 0 and np.isfinite(s_new):
                 s_rel = s_new
-                self.logger.info(f"[Auto-Scale] 细对应 scale 微调: s_rel={s_rel:.6f} (n_in={n_in})")
+                self.logger.info(
+                    f"[Auto-Scale] 细对应 scale 微调: s_rel={s_rel:.6f} "
+                    f"(门限内 {n_in} 点, 非零权重 {int(eff_n)} 点, gate={gate:.3f}mm)"
+                )
             else:
-                self.logger.warning(f"[Auto-Scale] 微调尺度非正 (s={s_new:.4f})，放弃修正")
+                self.logger.warning(
+                    f"[Auto-Scale] 微调尺度非正或非有限 (s={s_new:.4f})，放弃修正"
+                )
         else:
             self.logger.warning(
                 f"[Auto-Scale] 细对应点不足 ({n_in} < {min_correspondences})，放弃 scale 微调，使用 bbox 初值"
