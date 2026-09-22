@@ -1,11 +1,8 @@
 """#9: 综合报告的"输出文件清单"只能列本次运行生成的文件。"""
 
+import _bootstrap  # noqa: F401  # 必须先于 open3d 导入，固定 OpenMP 线程数
 import os
 import sys
-
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
@@ -13,7 +10,6 @@ import unittest  # noqa: E402
 import numpy as np  # noqa: E402
 
 from report import ReportGenerator  # noqa: E402
-
 
 class TestWrittenFileTracking(unittest.TestCase):
     def setUp(self):
@@ -60,7 +56,6 @@ class TestWrittenFileTracking(unittest.TestCase):
         names = [f.name for f in self.reporter.list_written_files()]
         self.assertEqual(names, ["a.json", "b.json"])
 
-
 class TestSummaryListsOnlyThisRun(unittest.TestCase):
     """复用旧输出目录时，清单不得把历史残留算作本次产物。"""
 
@@ -80,7 +75,8 @@ class TestSummaryListsOnlyThisRun(unittest.TestCase):
                 input_file="dummy.ply", stl_file=None,
                 icp_init_method="N/A", total_time=1.0,
             )
-            text = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
 
             section = text.split("--- 7. 输出文件清单")[1]
 
@@ -100,7 +96,8 @@ class TestSummaryListsOnlyThisRun(unittest.TestCase):
                 input_file="d.ply", stl_file=None,
                 icp_init_method="N/A", total_time=1.0,
             )
-            text = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
             section = text.split("--- 7. 输出文件清单")[1].split("注:")[0]
             self.assertIn("report.json", section)
             self.assertIn("inspection_report.txt", section)
@@ -113,9 +110,9 @@ class TestSummaryListsOnlyThisRun(unittest.TestCase):
                 input_file="d.ply", stl_file=None,
                 icp_init_method="N/A", total_time=1.0,
             )
-            text = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
             self.assertNotIn("并非本次生成", text)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

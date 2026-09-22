@@ -1,11 +1,8 @@
 """#4: 距离类阈值必须随数据尺度自适应，而非硬编码绝对值。"""
 
+import _bootstrap  # noqa: F401  # 必须先于 open3d 导入，固定 OpenMP 线程数
 import os
 import sys
-
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
 import unittest  # noqa: E402
 
@@ -19,12 +16,10 @@ from merger import PlaneMerger  # noqa: E402
 from plane import Plane  # noqa: E402
 from preprocess import PointCloudPreprocessor  # noqa: E402
 
-
 def _cloud(points):
     c = o3d.geometry.PointCloud()
     c.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=float))
     return c
-
 
 def _box_planes(scale=1.0, jitter=0.0):
     """构造一个长方体的 3 个互相垂直的面 (单位边长 scale)。"""
@@ -49,7 +44,6 @@ def _box_planes(scale=1.0, jitter=0.0):
         planes.append(Plane(plane_id=pid, model=[*normal, -offset], cloud=_cloud(pts)))
     return planes
 
-
 class TestDiagonalOf(unittest.TestCase):
     def test_matches_manual_computation(self):
         pts = np.array([[0.0, 0, 0], [3.0, 4, 0], [0, 0, 12.0]])
@@ -67,7 +61,6 @@ class TestDiagonalOf(unittest.TestCase):
         pts = np.array([[0.0, 0, 0], [np.nan, 1, 1]])
         self.assertEqual(diagonal_of(pts), 0.0)
 
-
 class TestResolveThreshold(unittest.TestCase):
     def test_explicit_wins(self):
         self.assertEqual(resolve_threshold(0.05, 100.0, 0.01), 0.05)
@@ -83,7 +76,6 @@ class TestResolveThreshold(unittest.TestCase):
         for bad in (0.0, -1.0, float("nan")):
             with self.assertRaises(ValueError, msg=f"explicit={bad} 应被拒绝"):
                 resolve_threshold(bad, 100.0, 0.01)
-
 
 class TestMergerThresholdIsScaleRelative(unittest.TestCase):
     """共面融合的判定阈值必须随场景尺度等比缩放。"""
@@ -149,7 +141,6 @@ class TestMergerThresholdIsScaleRelative(unittest.TestCase):
     def test_seam_voxel_rejects_invalid_divisor(self):
         PlaneMerger(seam_voxel_divisor=0)
 
-
 class TestGeometryThresholdIsScaleRelative(unittest.TestCase):
     def _build_graph(self, scale):
         """构造长方体三面 (两两垂直) 的拓扑图。"""
@@ -187,7 +178,6 @@ class TestGeometryThresholdIsScaleRelative(unittest.TestCase):
         verts = analyzer.compute_intersection_vertices(self._build_graph(1.0))
         self.assertEqual(len(verts), 1)
 
-
 class TestNormalRadiusIsScaleRelative(unittest.TestCase):
     def test_radius_scales_with_cloud(self):
         ratios = []
@@ -213,7 +203,6 @@ class TestNormalRadiusIsScaleRelative(unittest.TestCase):
             pre.normal_radius_ratio, floor=1e-9, name="r",
         )
         self.assertGreater(radius, 0.0)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

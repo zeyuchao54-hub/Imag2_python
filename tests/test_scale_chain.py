@@ -1,12 +1,9 @@
 """#3: 尺度链路不变量——Plane.scale 后所有派生量同步，且导出层不再二次补乘。"""
 
+import _bootstrap  # noqa: F401  # 必须先于 open3d 导入，固定 OpenMP 线程数
 import json
 import os
 import sys
-
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
@@ -16,7 +13,6 @@ import open3d as o3d  # noqa: E402
 
 from plane import Plane  # noqa: E402
 from report import ReportGenerator  # noqa: E402
-
 
 def _make_plane(plane_id, normal, offset, extent=30.0, n=600):
     normal = np.asarray(normal, dtype=float)
@@ -35,7 +31,6 @@ def _make_plane(plane_id, normal, offset, extent=30.0, n=600):
     cloud.points = o3d.utility.Vector3dVector(pts)
     # 点位于 +normal*offset 一侧，故方程为 n.x + d = 0 且 d = -offset
     return Plane(plane_id=plane_id, model=[*normal, -offset], cloud=cloud)
-
 
 class TestPlaneScale(unittest.TestCase):
     def setUp(self):
@@ -96,7 +91,6 @@ class TestPlaneScale(unittest.TestCase):
         self.plane.scale(1.0)
         self.assertTrue(np.allclose(self.plane.model, before_model))
         self.assertTrue(np.allclose(np.asarray(self.plane.cloud.points), before_pts))
-
 
 class TestExportJsonHasNoHiddenScaling(unittest.TestCase):
     """export_json 必须原样输出 Plane 的物理值，不得再乘任何 factor。"""
@@ -161,7 +155,6 @@ class TestExportJsonHasNoHiddenScaling(unittest.TestCase):
         self.assertLess(rel_err, 1e-5,
                         f"报表方程与 fused.ply 点云单位不一致: max|r|={np.max(np.abs(residual)):.3e}, "
                         f"相对误差={rel_err:.3e} (坐标量级 {coord_scale:.1f})")
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

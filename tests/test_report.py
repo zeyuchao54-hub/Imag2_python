@@ -1,11 +1,8 @@
 """#2: STEP 导出必须诚实——没有 CAD 后端时不得返回路径、不得落盘。"""
 
+import _bootstrap  # noqa: F401  # 必须先于 open3d 导入，固定 OpenMP 线程数
 import os
 import sys
-
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
@@ -14,7 +11,6 @@ import logging  # noqa: E402
 import numpy as np  # noqa: E402
 
 from report import ReportGenerator  # noqa: E402
-
 
 class TestStepExportHonesty(unittest.TestCase):
     def setUp(self):
@@ -73,7 +69,6 @@ class TestStepExportHonesty(unittest.TestCase):
         if result is not None:
             self.assertTrue(os.path.isfile(result),
                             f"export_step 返回了 {result}，但该文件并不存在")
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

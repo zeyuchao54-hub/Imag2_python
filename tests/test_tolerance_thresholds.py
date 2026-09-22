@@ -1,11 +1,8 @@
 """#6/#7: 公差阈值必须分纲 (长度 vs 角度)，每项须记录所用阈值与算法性质。"""
 
+import _bootstrap  # noqa: F401  # 必须先于 open3d 导入，固定 OpenMP 线程数
 import os
 import sys
-
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
 import unittest  # noqa: E402
 
@@ -13,7 +10,6 @@ import numpy as np  # noqa: E402
 
 from features import PlaneFeature  # noqa: E402
 from tolerance import ToleranceAnalyzer, ToleranceResult  # noqa: E402
-
 
 def _plane(pid, normal, centroid, n=200, spread=0.3):
     """构造一个带噪声的平面特征。"""
@@ -33,7 +29,6 @@ def _plane(pid, normal, centroid, n=200, spread=0.3):
         d=0.0, points=pts, source="scan",
     )
 
-
 class TestThresholdSeparation(unittest.TestCase):
     def test_defaults_are_independent(self):
         a = ToleranceAnalyzer(tolerance_threshold_mm=2.0, angle_threshold_deg=5.0)
@@ -50,7 +45,6 @@ class TestThresholdSeparation(unittest.TestCase):
                 ToleranceAnalyzer(tolerance_threshold_mm=bad)
             with self.assertRaises(ValueError, msg=f"angle={bad} 应被拒绝"):
                 ToleranceAnalyzer(angle_threshold_deg=bad)
-
 
 class TestAngularTolerancesUseAngleThreshold(unittest.TestCase):
     """方向公差必须按角度阈值判定，与长度阈值无关。"""
@@ -105,7 +99,6 @@ class TestAngularTolerancesUseAngleThreshold(unittest.TestCase):
         self.assertEqual(r_a.unit, "deg")
         self.assertEqual(r_a.threshold, 5.0)
 
-
 class TestLinearTolerancesUseMmThreshold(unittest.TestCase):
     def test_flatness_uses_mm_threshold(self):
         noisy = _plane(1, [0, 0, 1], [0, 0, 0], spread=1.0)
@@ -131,7 +124,6 @@ class TestLinearTolerancesUseMmThreshold(unittest.TestCase):
         self.assertEqual(loose._profile_of_surface(dev).status, "PASS")
         self.assertEqual(strict._profile_of_surface(dev).status, "FAIL")
         self.assertEqual(loose._profile_of_surface(dev).threshold, 10.0)
-
 
 class TestSelfDescribingResults(unittest.TestCase):
     """#7: 每项结果必须自描述阈值与算法性质，避免误导下游读者。"""
@@ -198,7 +190,6 @@ class TestSelfDescribingResults(unittest.TestCase):
         for r in labelled:
             self.assertIn("simplified", r.algorithm.lower(),
                           f"{r.name} 的算法标注未说明是简化实现")
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

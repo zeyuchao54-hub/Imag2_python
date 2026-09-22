@@ -1,11 +1,10 @@
 """#8: 性能——偏差分析向量化，顶点去重由 O(n^2) 降为 O(n log n)。"""
 
+import _bootstrap  # noqa: F401  # 必须先于 open3d 导入，固定 OpenMP 线程数
 import os
 import sys
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
 import unittest  # noqa: E402
 import time  # noqa: E402
@@ -15,14 +14,12 @@ import open3d as o3d  # noqa: E402
 
 from deviation import DeviationAnalyzer  # noqa: E402
 
-
 def _cloud(points, normals=None):
     c = o3d.geometry.PointCloud()
     c.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=float))
     if normals is not None:
         c.normals = o3d.utility.Vector3dVector(np.asarray(normals, dtype=float))
     return c
-
 
 def _reference_one_direction(source_pts, source_normals, target_pts,
                              target_normals, use_source_normals):
@@ -44,7 +41,6 @@ def _reference_one_direction(source_pts, source_normals, target_pts,
         ln = np.linalg.norm(n)
         signed[i] = float(np.dot(diff, n / ln)) if ln > 1e-12 else unsigned[i]
     return signed, unsigned
-
 
 class TestDeviationVectorization(unittest.TestCase):
     """向量化必须与旧逐点实现逐位一致。"""
@@ -137,7 +133,6 @@ class TestDeviationVectorization(unittest.TestCase):
         # 实测约 100 倍加速，阈值取 5 倍留有充足余量
         self.assertLess(t_vec, t_ref / 5.0,
                         f"向量化 {t_vec:.4f}s 未显著快于逐点 {t_ref:.4f}s")
-
 
 class TestVertexDedup(unittest.TestCase):
     """顶点去重: 语义与原实现一致，且不再二次增长。"""
@@ -239,7 +234,6 @@ class TestVertexDedup(unittest.TestCase):
     def test_handles_degenerate_input(self):
         self.assertEqual(len(self._run_new(np.zeros((1, 3)))), 1)
 
-
 class TestColorizeVectorization(unittest.TestCase):
     """向量化色谱必须与标量 _diverging_color 逐位一致。"""
 
@@ -278,7 +272,6 @@ class TestColorizeVectorization(unittest.TestCase):
         )
         self.assertTrue(np.allclose(np.asarray(colored.colors), [0.8, 0.8, 0.8]))
 
-
 class TestCadLoaderVertexMerge(unittest.TestCase):
     """真实的 CADLoader.get_vertices 在新算法下仍给出正确的名义顶点。"""
 
@@ -300,7 +293,6 @@ class TestCadLoaderVertexMerge(unittest.TestCase):
             tree = cKDTree(verts)
             self.assertEqual(len(tree.query_pairs(0.01, output_type="ndarray")), 0,
                              "去重后仍有距离 <0.01 的顶点对")
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

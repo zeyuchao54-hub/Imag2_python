@@ -1,17 +1,9 @@
 """可复现性: 固定种子后，同一输入必须逐位复现。"""
 
+import _bootstrap  # noqa: F401  # 必须先于 open3d 导入，固定 OpenMP 线程数
 import os
 
-# 必须在 import open3d 之前固定 OpenMP 线程数，原因同 main.py:
-# Open3D 的 RANSAC 在多线程下有竞态。测试进程不能依赖"某个测试先 import 了 main"
-# 才顺带设置好环境变量——那也是此前本测试偶发失败的原因。
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-
 import sys
-
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
@@ -22,7 +14,6 @@ import open3d as o3d  # noqa: E402
 
 from plane import Plane  # noqa: E402
 from features import FeatureExtractor  # noqa: E402
-
 
 def _disk_cloud(surfaces, n=900):
     """构造带孔圆柱的简化点云: 圆柱侧壁 + 顶底环。"""
@@ -37,7 +28,6 @@ def _disk_cloud(surfaces, n=900):
     cloud = o3d.geometry.PointCloud()
     cloud.points = o3d.utility.Vector3dVector(np.vstack(pts))
     return cloud
-
 
 class TestObbJitterReproducible(unittest.TestCase):
     """_compute_obb 的防共面抖动必须是确定性的。"""
@@ -57,7 +47,6 @@ class TestObbJitterReproducible(unittest.TestCase):
             self.assertTrue(np.allclose(obb.center, results[0].center, atol=1e-9))
             self.assertTrue(np.allclose(obb.extent, results[0].extent, atol=1e-9))
             self.assertTrue(np.allclose(obb.R, results[0].R, atol=1e-9))
-
 
 class TestCylinderRansacReproducible(unittest.TestCase):
     def test_same_seed_same_cylinders(self):
@@ -84,7 +73,6 @@ class TestCylinderRansacReproducible(unittest.TestCase):
         # 至少出现两种不同的拟合结果，说明种子有效
         self.assertGreater(len(sigs), 1, "不同种子得到完全相同的结果，seed 可能未生效")
 
-
 class TestSeedAcceptance(unittest.TestCase):
     """_seed_everything 必须接受合法种子并拒绝非法值。"""
 
@@ -102,7 +90,6 @@ class TestSeedAcceptance(unittest.TestCase):
         IndustrialPipeline._seed_everything(pipe, 7)
         IndustrialPipeline._seed_everything(pipe, 0)
         # 不应抛错即通过
-
 
 class TestOpen3DRansacDeterministic(unittest.TestCase):
     """
@@ -171,7 +158,6 @@ class TestOpen3DRansacDeterministic(unittest.TestCase):
             self._run_extraction_sequence(seed=42),
             self._run_extraction_sequence(seed=42),
         ))
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

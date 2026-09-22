@@ -1,8 +1,6 @@
+import logging
 import numpy as np
 import open3d as o3d
-
-#: _compute_obb 防退化抖动使用的固定种子，保证 OBB 可复现
-_JITTER_SEED = 20240901
 
 
 class Plane:
@@ -10,6 +8,13 @@ class Plane:
     工业级平面数据对象 (Data Object)
     职责: 封装单一面片的物理与几何属性，提供基础的数学计算接口
     """
+
+    #: OBB 退化修复时，合成支撑点沿退化方向的偏移量相对于点云对角线的比例。
+    #: 取 1e-6: 足以让 qhull 摆脱共面退化，又小到不改变包围盒的物理含义。
+    _SUPPORT_EPS_RATIO = 1e-6
+
+    #: 判定某一维度"退化"的阈值: 奇异值小于最大奇异值的该倍数即视为无方差。
+    _DEGENERATE_SV_RATIO = 1e-9
 
     def __init__(self, plane_id: int, model: list, cloud: o3d.geometry.PointCloud):
         """
@@ -31,20 +36,137 @@ class Plane:
         self.obb = self._compute_obb()
         self.area = self._estimate_area()
 
+    @classmethod
+    def _add_degenerate_supports(cls, points: np.ndarray) -> np.ndarray:
+        """
+        为几何退化的点云补齐"最小三维构型"，使 qhull 能求出 OBB。
+
+        动机: 完美共面的 CAD 面片采样点云会让 get_oriented_bounding_box()
+        因凸包退化而抛 RuntimeError。旧实现是对**所有点**加随机抖动
+        (np.random.normal, std=1e-6)，需要固定种子才能复现。
+
+        现改用 CAD-Deform 的"第五顶点"思路并推广到一般形式:
+        用 SVD 分解点云，找出方差为 0 的方向，沿每个退化方向补**一个**支撑点。
+        零随机性、完全可复现；原有顶点分毫未动，面内几何不被扰动；
+        偏移量与点云尺度成比例，而非绝对常量。
+
+        注意: 该方法只能让 qhull "不报错"，并不能得到正确的最小体积盒——
+        实测 Open3D 对补齐后的共面点云返回的是**轴对齐**包围盒
+        (旋转 35° 的 20x20 共面正方形得到 27.85 而非 20)。
+        正确做法见 _analytic_coplanar_obb()。
+
+        :param points: (N,3) 点云坐标
+        :return: 补齐后的 (N+k,3) 点云坐标
+        """
+        centroid = points.mean(axis=0)
+        diag = float(np.linalg.norm(np.ptp(points, axis=0)))
+        eps = max(diag * cls._SUPPORT_EPS_RATIO, 1e-12)
+
+        supports = []
+        try:
+            _, s, vh = np.linalg.svd(points - centroid, full_matrices=False)
+        except np.linalg.LinAlgError:
+            s, vh = None, None
+
+        if s is not None and s[0] > 0:
+            # s 降序; 奇异值可忽略的方向即无方差方向，沿其补一个支撑点
+            tol = s[0] * cls._DEGENERATE_SV_RATIO
+            for k in range(min(3, len(s))):
+                if s[k] <= tol:
+                    supports.append(centroid + vh[k] * eps)
+
+        if not supports:
+            # SVD 不可用或已满秩 (正常不会进入此处): 沿三坐标轴兜底补点
+            for axis in (np.array([1.0, 0.0, 0.0]),
+                         np.array([0.0, 1.0, 0.0]),
+                         np.array([0.0, 0.0, 1.0])):
+                supports.append(centroid + axis * eps)
+
+        return np.vstack([points] + [sp[None, :] for sp in supports])
+
+    def _analytic_coplanar_obb(self) -> o3d.geometry.OrientedBoundingBox:
+        """
+        为完美共面的点云**解析构造** OBB。
+
+        为什么不用 Open3D: 它的 get_oriented_bounding_box() 靠凸包枚举候选朝向。
+        共面点云的凸包退化为二维，该算法随之退化为返回**轴对齐**包围盒 ——
+        实测旋转 35° 的 20x20 共面正方形得到 27.85 (= 20·(cos35°+sin35°))，
+        而正确的最小体积盒是 20x20。旧实现在此处加随机抖动，得到的更糟:
+        30x30 共面正方形被算成 42.22x42.22 (≈30·√2，面内尺寸误差 40%)。
+
+        共面情形下我们本来就**知道**平面的法向 (来自 RANSAC 平面方程)，
+        因此可以直接构造: 第三轴取平面法向，面内两轴取投影点 SVD 的主方向。
+        零随机性、零对 Open3D 凸包内部行为的依赖，且对各向异性的真实面片精确。
+
+        局限 (固有，非缺陷): 若面片在面内各向同性 (例如正方形点阵的协方差为 σ²I)，
+        面内主方向不唯一，此时退化为 (u,v) 基下的轴对齐盒，与 Open3D 的降级行为一致。
+        """
+        points = np.asarray(self.cloud.points)
+        centroid = points.mean(axis=0)
+        diag = float(np.linalg.norm(np.ptp(points, axis=0)))
+
+        # 第三轴: 平面法向 (退化时退回 SVD 最小方差方向)
+        n = np.asarray(self.normal, dtype=float)
+        n_norm = float(np.linalg.norm(n))
+        if n_norm < 1e-12:
+            _, _, vh = np.linalg.svd(points - centroid, full_matrices=False)
+            n = vh[-1]
+        else:
+            n = n / n_norm
+
+        # 面内正交基 (u, v)
+        ref = np.array([0.0, 0.0, 1.0]) if abs(n[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        u = np.cross(n, ref)
+        u_norm = float(np.linalg.norm(u))
+        if u_norm < 1e-12:
+            u = np.cross(n, np.array([1.0, 0.0, 0.0]))
+            u_norm = float(np.linalg.norm(u))
+        u = u / u_norm
+        v = np.cross(n, u)  # n、u 均为单位正交向量，v 已是单位向量
+
+        # 面内主方向
+        centered = points - centroid
+        coords = np.column_stack([centered @ u, centered @ v])
+        _, _, vh2 = np.linalg.svd(coords, full_matrices=False)
+        p1 = u * vh2[0, 0] + v * vh2[0, 1]
+        p2 = u * vh2[1, 0] + v * vh2[1, 1]
+
+        e1 = max(float(np.ptp(centered @ p1)), 0.0)
+        e2 = max(float(np.ptp(centered @ p2)), 0.0)
+        # 共面点云在法向上的跨度理论上为 0; 下限取尺度相关量，避免下游遇到精确 0
+        e3 = max(float(np.ptp(centered @ n)), diag * self._SUPPORT_EPS_RATIO, 1e-12)
+
+        R = np.column_stack([p1, p2, n])
+        if float(np.linalg.det(R)) < 0:  # 保证右手系
+            R[:, 1] = -R[:, 1]
+
+        return o3d.geometry.OrientedBoundingBox(
+            center=centroid, R=R, extent=np.array([e1, e2, e3])
+        )
+
     def _compute_obb(self) -> o3d.geometry.OrientedBoundingBox:
-        """计算定向包围盒，对完美共面的 CAD 点云做抖动容错。"""
+        """计算定向包围盒，对完美共面的 CAD 点云做解析式退化容错。"""
         try:
             return self.cloud.get_oriented_bounding_box()
         except RuntimeError:
-            # CAD 点云可能完美共面，导致 qhull 失败。加入微小抖动后重试。
-            # 抖动必须可复现: 使用固定种子的局部 Generator，避免每次 Import/
-            # 每次运行的 OBB 都不同 (否则可视化与 report.json 无法稳定复现)。
-            rng = np.random.default_rng(_JITTER_SEED)
-            jittered = o3d.geometry.PointCloud()
-            pts = np.asarray(self.cloud.points)
-            noise = rng.normal(0, 1e-6, pts.shape)
-            jittered.points = o3d.utility.Vector3dVector(pts + noise)
-            return jittered.get_oriented_bounding_box()
+            pass
+
+        # 退化路径: 共面点云改用解析构造 (见 _analytic_coplanar_obb 的说明)
+        points = np.asarray(self.cloud.points)
+        if len(points) >= 3:
+            try:
+                return self._analytic_coplanar_obb()
+            except (np.linalg.LinAlgError, ValueError) as e:
+                logging.getLogger("PointToCAD_System.Plane").warning(
+                    f"平面 P{self.id} 解析构造 OBB 失败 ({e})，降级为轴对齐包围盒"
+                )
+
+        # 点数不足或解析失败: 降级为轴对齐包围盒并告警，
+        # 而不是像旧实现那样静默给出一个被随机性污染的 OBB。
+        logging.getLogger("PointToCAD_System.Plane").warning(
+            f"平面 P{self.id} 无法计算定向包围盒 (点数 {len(points)})，降级为轴对齐包围盒"
+        )
+        return self.cloud.get_axis_aligned_bounding_box()
 
     def _compute_normal(self) -> np.ndarray:
         """提取并标准化平面的法向量 (A, B, C)"""
@@ -152,7 +274,9 @@ class Plane:
         """
         self.cloud = new_cloud
         self.centroid = self.cloud.get_center()
-        self.obb = self.cloud.get_oriented_bounding_box()
+        # 复用 _compute_obb 而非直接调用 get_oriented_bounding_box():
+        # 后者在完美共面点云上会抛 RuntimeError，而融合后的点云正是这种情况的高发场景
+        self.obb = self._compute_obb()
         self.area = self._estimate_area()
 
     def scale(self, factor: float) -> 'Plane':

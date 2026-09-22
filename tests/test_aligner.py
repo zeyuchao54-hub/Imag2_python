@@ -2,9 +2,9 @@
 PointToCAD 测试套件（标准库 unittest，无需安装 pytest）
 
 运行方式（项目根目录）:
-    .venv310\\Scripts\\python.exe -m unittest discover -s tests -v
-"""
+    .venv310\\Scripts\\python.exe -m unittest discover -s tests -v"""
 
+import _bootstrap  # noqa: F401  # 必须先于 open3d 导入，固定 OpenMP 线程数
 import os
 import sys
 
@@ -20,7 +20,6 @@ import open3d as o3d  # noqa: E402
 
 from aligner import DatumAligner  # noqa: E402
 from plane import Plane  # noqa: E402
-
 
 def _make_plane(plane_id, normal, offset, extent=40.0, n=800, jitter=0.01):
     """构造一个带噪声的理想平面点云。"""
@@ -41,7 +40,6 @@ def _make_plane(plane_id, normal, offset, extent=40.0, n=800, jitter=0.01):
     cloud.points = o3d.utility.Vector3dVector(pts)
     # 点位于 +normal*offset 一侧，故方程为 n.x + d = 0 且 d = -offset
     return Plane(plane_id=plane_id, model=[*normal, -offset], cloud=cloud)
-
 
 class TestRotationBetweenVectors(unittest.TestCase):
     """#1: _get_rotation_matrix_between_vectors 必须恒为正规旋转 (det=+1)。"""
@@ -105,7 +103,6 @@ class TestRotationBetweenVectors(unittest.TestCase):
     def test_zero_vector_degrades_to_identity(self):
         R = self.aligner._get_rotation_matrix_between_vectors([0, 0, 0], [0, 0, 1])
         self.assertTrue(np.allclose(R, np.eye(3)))
-
 
 class TestDatumAlignment(unittest.TestCase):
     """3-2-1 对齐端到端: 旋转必须正规，主基准面必须落到 Z=0。"""
@@ -187,7 +184,6 @@ class TestDatumAlignment(unittest.TestCase):
             primary_plane_id=1, secondary_plane_id=2
         )
         self.assertAlmostEqual(abs(float(np.linalg.det(T))), 1.0, places=9)
-
 
 class TestDatumOriginResolution(unittest.TestCase):
     """#5: 3-2-1 原点必须取三基准面交点，并有明确回退链。"""
@@ -278,7 +274,6 @@ class TestDatumOriginResolution(unittest.TestCase):
         # 旧原点不在主基准面上 → 新截距 = d_A = 30，明显偏离 Z=0
         self.assertGreater(abs(d_a + float(np.dot(n_a, origin_old))), 1.0,
                            "旧原点下主基准面应明显偏离 Z=0")
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
